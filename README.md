@@ -63,6 +63,12 @@
 
 </div>
 
+<p align="center">
+  <video width="720" poster="assets/media/gifs/02.jpg" controls loop muted playsinline>
+    <source src="assets/media/gifs/02.mp4" type="video/mp4">
+  </video>
+</p>
+
 ---
 
 ## ✨ Features
