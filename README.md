@@ -61,11 +61,11 @@
 
 [✨ Features](#-features) • [📋 TODO](#-todo) • [📦 Installation](#-installation) • [🚀 Quick Start](#-quick-start) • [📡 Deployment](#-deployment) • [📝 Citation](#-citation)
 
-</div>
+<br />
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/d1980b9d-6a32-4b8c-9c66-6c563af09df9" width="720" autoplay loop muted playsinline></video>
-</p>
+<video src="https://github.com/user-attachments/assets/d1980b9d-6a32-4b8c-9c66-6c563af09df9" width="92%" autoplay loop muted playsinline></video>
+
+</div>
 
 ---
 
