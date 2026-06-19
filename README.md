@@ -63,7 +63,7 @@
 
 <br />
 
-<video src="https://github.com/user-attachments/assets/d1980b9d-6a32-4b8c-9c66-6c563af09df9" width="92%" autoplay loop muted playsinline></video>
+<img src="assets/media/gifs/02-demo.gif" width="64%" alt="LabVLA Demo" />
 
 </div>
 
