@@ -10,7 +10,7 @@
 </div>
 
 <div align="center">
-  <img src="https://readme-typing-svg.herokuapp.com?font=Orbitron&size=24&duration=3000&pause=1000&color=00D9FF&center=true&vCenter=true&width=720&lines=Welcome+to+LabVLA;Vision-Language-Action+for+the+Laboratory;Qwen3-VL+%2B+DiT+Flow-Matching+Action+Expert" alt="Typing Animation" />
+  <img src="https://readme-typing-svg.herokuapp.com?font=Orbitron&size=24&duration=3000&pause=1000&color=00D9FF&center=true&vCenter=true&width=720&lines=Welcome+to+LabVLA;Vision-Language-Action+for+the+Laboratory;Qwen3-VL+%2B+DiT+Flow-Matching+Action+Expert;Towards+AI+Scientists+That+Can+Physically+Perform+Scientific+Experiments" alt="Typing Animation" />
 </div>
 
 <p align="center">
