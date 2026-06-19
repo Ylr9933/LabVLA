@@ -64,9 +64,7 @@
 </div>
 
 <p align="center">
-  <video width="720" poster="assets/media/gifs/02.jpg" controls loop muted playsinline>
-    <source src="assets/media/gifs/02.mp4" type="video/mp4">
-  </video>
+  <video src="https://github.com/user-attachments/assets/d1980b9d-6a32-4b8c-9c66-6c563af09df9" width="720" autoplay loop muted playsinline></video>
 </p>
 
 ---
