@@ -5,7 +5,7 @@
   <img src="assets/logo/labvla-wordmark.png" height="56" alt="LabVLA" />
 </p>
 
-<h3 align="center"> Grounding Vision–Language–Action Models in Scientific Laboratories </h3>
+<h3 align="center"> The First Vision-Language-Action Foundation Model for Scientific Laboratories </h3>
 
 </div>
 
