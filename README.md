@@ -53,13 +53,11 @@
   <div style="width: 100%; height: 2px; margin: 20px 0; background: linear-gradient(90deg, transparent, #00d9ff, transparent);"></div>
 </div>
 
-**LabVLA** turns a **Qwen3-VL-4B-Instruct** vision–language backbone into a real-time robot controller through a **DiT flow-matching action expert**, trained with the π0.5 recipe: FAST action-token pre-training → flow-matching post-training with knowledge insulation → task fine-tuning. This README covers **installation and deployment** — method details are in the [paper](#-citation).
-
-> **Note:** This repository currently ships **inference & deployment** only. The full training and fine-tuning code is being organized and will be released soon — see [TODO](#-todo).
+**LabVLA** turns a **Qwen3-VL-4B-Instruct** vision–language backbone into a real-time robot controller through a **DiT flow-matching action expert**, trained with the π0.5 recipe: FAST action-token pre-training → flow-matching post-training with knowledge insulation → task fine-tuning. This README covers **installation, training, and deployment** — method details are in the [paper](#-citation).
 
 <div align="center">
 
-[✨ Features](#-features) • [📋 TODO](#-todo) • [📦 Installation](#-installation) • [🚀 Quick Start](#-quick-start) • [📡 Deployment](#-deployment) • [📝 Citation](#-citation)
+[✨ Features](#-features) • [📋 TODO](#-todo) • [📦 Installation](#-installation) • [🚀 Quick Start](#-quick-start) • [🎓 Training](#-training) • [🔧 Fine-tuning](#-fine-tuning) • [📡 Deployment](#-deployment) • [📝 Citation](#-citation)
 
 <br />
 
@@ -98,10 +96,11 @@
 
 - [x] Model weights on Hugging Face
 - [x] Inference & deployment code
-- [ ] **Training & fine-tuning code** — *coming soon (being organized)*
-- [ ] Data processing pipeline — *coming soon*
+- [x] **Training & fine-tuning code**
+- [ ] **RoboGenesis** — *coming soon*
+- [ ] **labembodied-data** — *coming soon*
 
-We are actively organizing the training code and will release it soon. Stay tuned!
+The full training, post-training, and fine-tuning code is now available — see [Training](#-training). RoboGenesis and labembodied-data are being organized and will follow soon.
 
 ---
 
@@ -135,6 +134,61 @@ PRETRAINED_PATH=/path/to/LabVLA bash deployment/deploy.sh
 ```
 
 **3. Evaluate** — connect your robot or simulator client to the server and run rollouts. See [Deployment](#-deployment) for configuration details.
+
+---
+
+## 🎓 Training
+
+One entrypoint (`scripts/train.py`) for all stages, launched through Accelerate + DeepSpeed ZeRO-2 (bf16). Edit the variables at the top of each launch script before running.
+
+### 1 · Prepare data
+
+```bash
+python -m data_process scan  --root /path/to/dataset --out /tmp/report.json     # detect bad episodes
+python -m data_process clean --src  /path/to/dataset --dst /path/to/clean \
+                             --report /tmp/report.json                          # apply report (symlink copy)
+python -m data_process stats --dataset /path/to/clean --schema robointer_droid  # normalization stats
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `scan` | Detect bad episodes (corrupt video, decode failures, missing files). |
+| `clean` | Apply a scan report as a renumbered symlink copy; originals untouched. |
+| `stats` | Compute normalization statistics → `meta/stats.json`. |
+| `validate` | Cross-repo integrity checks. |
+| `preflight` | Gate a launch on HIGH/CRIT issues before it starts. |
+
+Each dataset is described by an auto-registered `DatasetSchema` ([`src/schema/`](src/schema/)). Add a module under [`schemas/`](schemas/) or pass `--dataset_schema /abs/path.py`.
+
+### 2 · VLM Pre-training
+
+Train the Qwen3-VL backbone on FAST action-token cross-entropy, with robot state discretized into the prompt. Defaults to a joint mixture of `robointer_droid_clean`, `oxe-auge_clean`, `RoboInter-VQA`, and `agibot_world` (π0-style `n^0.43` volume weighting).
+
+```bash
+bash launch/vlm_pretrain/train_vlm_pretrain.sh
+```
+
+### 3 · Flow-Matching Post-training (Knowledge Insulation)
+
+Train the DiT action expert to generate 50-step continuous action chunks, with stop-gradient between the VLM and the DiT.
+
+```bash
+bash launch/ki_posttrain/train_ki_posttrain.sh
+```
+
+> **Note:** LabVLA is not limited to the datasets listed above. Extend it to any new dataset by adding a `DatasetSchema` under [`schemas/`](schemas/) — the full pipeline (VLM pre-training, post-training, and fine-tuning) works out of the box.
+
+---
+
+## 🔧 Fine-tuning
+
+Fine-tune a post-trained checkpoint for a downstream task; this does not require the data-preparation step above.
+
+```bash
+# Edit launch/finetune/train_labutopia.sh: set PretrainedCkpt, DataRoot,
+# RepoIds, DatasetSchema, and ExternalStatsPath to point at your task data.
+bash launch/finetune/train_labutopia.sh
+```
 
 ---
 
