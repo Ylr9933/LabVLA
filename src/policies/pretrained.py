@@ -15,7 +15,6 @@ import abc
 import builtins
 import logging
 import os
-from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TypedDict, TypeVar
@@ -29,10 +28,9 @@ from safetensors.torch import load_model as load_model_as_safetensor, save_model
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
-from config.policies import PreTrainedConfig
-from config.train import TrainPipelineConfig
-from policies.utils import log_model_loading_keys
-from utils.hub import HubMixin
+from src.config.policies import PreTrainedConfig
+from src.policies.utils import log_model_loading_keys
+from src.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 
@@ -140,7 +138,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # Hub download path: keep the historical lenient default (remote
             # repos may legitimately ship partial weights); only enforce when a
             # caller explicitly requested strict loading.
-            hub_strict = bool(strict) if strict is not None else False
+            # The local default rejects missing keys; align the Hub default to
+            # match — callers wanting lenient remote loads pass strict=False.
+            hub_strict = bool(strict) if strict is not None else True
             try:
                 model_file = hf_hub_download(
                     repo_id=model_id,
@@ -270,57 +270,3 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
-    def push_model_to_hub(
-        self,
-        cfg: TrainPipelineConfig,
-    ):
-        api = HfApi()
-        repo_id = api.create_repo(
-            repo_id=self.config.repo_id, private=self.config.private, exist_ok=True
-        ).repo_id
-
-        # Push the files to the repo in a single commit
-        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            saved_path = Path(tmp) / repo_id
-
-            self.save_pretrained(saved_path)  # Calls _save_pretrained and stores model tensors
-
-            card = self.generate_model_card(
-                cfg.dataset.repo_id, self.config.type, self.config.license, self.config.tags
-            )
-            card.save(str(saved_path / "README.md"))
-
-            cfg.save_pretrained(saved_path)  # Calls _save_pretrained and stores train config
-
-            commit_info = api.upload_folder(
-                repo_id=repo_id,
-                repo_type="model",
-                folder_path=saved_path,
-                commit_message="Upload policy weights, train config and readme",
-                allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"],
-                ignore_patterns=["*.tmp", "*.log"],
-            )
-
-            logging.info(f"Model pushed to {commit_info.repo_url.url}")
-
-    def generate_model_card(
-        self, dataset_repo_id: str, model_type: str, license: str | None, tags: list[str] | None
-    ) -> ModelCard:
-        base_model = "lerobot/smolvla_base" if model_type == "smolvla" else None  # Set a base model
-
-        card_data = ModelCardData(
-            license=license or "apache-2.0",
-            library_name="lerobot",
-            pipeline_tag="robotics",
-            tags=list(set(tags or []).union({"robotics", "lerobot", model_type})),
-            model_name=model_type,
-            datasets=dataset_repo_id,
-            base_model=base_model,
-        )
-
-        template_card = (
-            files("templates").joinpath("lerobot_modelcard_template.md").read_text(encoding="utf-8")
-        )
-        card = ModelCard.from_template(card_data, template_str=template_card)
-        card.validate()
-        return card

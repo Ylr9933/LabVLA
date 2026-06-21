@@ -1,7 +1,7 @@
 """π0.5 §B.1 — robot proprioceptive state discretized into bins, prepended to
 the language prompt as text tokens.
 
-Equivalent to OpenTau `prepare_discrete_state` (modeling_pi05.py:693-705):
+Equivalent to OpenTau `prepare_discrete_state`:
   state ∈ [-1, 1] → bin_idx = floor((state + 1) * num_bins / 2) clamped to
   [0, num_bins - 1] → space-separated digit string.
 
@@ -32,13 +32,13 @@ Hydration:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
-from utils.constants import OBS_STATE
-from utils.logging_utils import warn_once
-from transforms.core import DataDict, DataTransformFn
+from src.utils.constants import OBS_STATE
+from src.utils.logging_utils import warn_once
+from src.transforms.core import DataDict, DataTransformFn
 
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,18 @@ class DiscretizeStateTransformFn(DataTransformFn):
             # silent no-op would drop the <state>...</state> prefix and conflate
             # "real robot sample with drift" with "VQA sample with no state".
             if missing_key is not None:
+                import os as _os
+                if _os.environ.get("LABVLA_ALLOW_MISSING_STATE_SUBKEYS") != "1":
+                    # A real robot sample silently losing its <state> prefix
+                    # would mix two different prompt contracts inside one run.
+                    raise KeyError(
+                        f"[DiscretizeStateTransformFn] has_real_state=True but "
+                        f"declared state sub-key {missing_key!r} is missing "
+                        f"from the sample (state_keys="
+                        f"{tuple(self.state_keys)!r}). Set "
+                        f"LABVLA_ALLOW_MISSING_STATE_SUBKEYS=1 to warn-and-"
+                        f"skip instead (mixed prompt contract)."
+                    )
                 warn_once(
                     logger,
                     ("state_discretize_missing_key", missing_key),
@@ -152,7 +164,7 @@ class DiscretizeStateTransformFn(DataTransformFn):
                 "skipping this sample is safer than serializing corrupted bins."
             )
 
-        # Clamp to [-1, 1] and quantize (matches OpenTau modeling_pi05.py:701).
+        # Clamp to [-1, 1] and quantize (matches OpenTau).
         state = torch.clamp(state, -1.0, 1.0)
         bin_indices = ((state + 1.0) * (self.num_bins / 2.0)).long().clamp(0, self.num_bins - 1)
         # Flatten (state may be 1D after PadStateAndActionTransformFn or before).
@@ -165,3 +177,16 @@ class DiscretizeStateTransformFn(DataTransformFn):
             old_prompt = str(old_prompt) if old_prompt is not None else ""
         data["task"] = f"{self.wrap_open}{state_text}{self.wrap_close}\n{old_prompt}"
         return data
+
+    def hydrate(self, ctx) -> "DiscretizeStateTransformFn":
+        # Inject schema.state_keys so the transform can transiently concat
+        # per-key state tensors when OBS_STATE has not yet been built by
+        # ComposeFieldsTransform (split-state schemas like robointer_droid).
+        # For single-key schemas where state_keys already equals (OBS_STATE,)
+        # this is a no-op fall-through.
+        t = replace(self, state_keys=tuple(ctx.schema.state_keys))
+        logging.info(
+            f"Hydrated {t.__class__.__name__} with state_keys="
+            f"{tuple(ctx.schema.state_keys)} ({ctx.schema.schema_id})"
+        )
+        return t

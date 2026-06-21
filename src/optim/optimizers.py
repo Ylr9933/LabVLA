@@ -21,14 +21,7 @@ from typing import Any
 
 import draccus
 import torch
-from safetensors.torch import load_file, save_file
 
-from dataset.utils import flatten_dict, unflatten_dict, write_json
-from utils.constants import (
-    OPTIMIZER_PARAM_GROUPS,
-    OPTIMIZER_STATE,
-)
-from utils.io_utils import deserialize_json_into_object
 
 logger = logging.getLogger(__name__)
 
@@ -372,96 +365,3 @@ class MultiAdamConfig(OptimizerConfig):
         return optimizers
 
 
-def save_optimizer_state(
-    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer], save_dir: Path
-) -> None:
-    """Save optimizer state to disk.
-
-    Args:
-        optimizer: Either a single optimizer or a dictionary of optimizers.
-        save_dir: Directory to save the optimizer state.
-    """
-    if isinstance(optimizer, dict):
-        for name, opt in optimizer.items():
-            optimizer_dir = save_dir / name
-            optimizer_dir.mkdir(exist_ok=True, parents=True)
-            _save_single_optimizer_state(opt, optimizer_dir)
-    else:
-        _save_single_optimizer_state(optimizer, save_dir)
-
-
-def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> None:
-    """Save a single optimizer's state to disk."""
-    state = optimizer.state_dict()
-    param_groups = state.pop("param_groups")
-    flat_state = flatten_dict(state)
-    save_file(flat_state, save_dir / OPTIMIZER_STATE)
-    write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
-
-
-def load_optimizer_state(
-    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer],
-    save_dir: Path,
-    strict: bool = True,
-) -> torch.optim.Optimizer | dict[str, torch.optim.Optimizer]:
-    """Load optimizer state from disk.
-
-    Args:
-        optimizer: Either a single optimizer or a dictionary of optimizers.
-        save_dir: Directory to load the optimizer state from.
-        strict: When ``True`` (default), a declared sub-optimizer whose state
-            directory is missing is a hard error. When ``False``, the missing
-            sub-optimizer is left freshly-built and a WARNING is logged.
-
-    Returns:
-        The updated optimizer(s) with loaded state.
-    """
-    if isinstance(optimizer, dict):
-        loaded_optimizers = {}
-        for name, opt in optimizer.items():
-            optimizer_dir = save_dir / name
-            if optimizer_dir.exists():
-                loaded_optimizers[name] = _load_single_optimizer_state(opt, optimizer_dir)
-            else:
-                # Fail loud by default: a missing sub-optimizer dir would
-                # otherwise resume "part state restored, part from zero"
-                # silently. strict=False falls back to a fresh optimizer.
-                if strict:
-                    raise FileNotFoundError(
-                        f"Missing optimizer state for declared sub-optimizer "
-                        f"'{name}' (expected {optimizer_dir}). Refusing to silently "
-                        f"resume with it freshly-initialized. Pass strict=False to "
-                        f"allow a partial resume."
-                    )
-                logger.warning(
-                    "Missing optimizer state for sub-optimizer '%s' (expected %s); "
-                    "starting it from a freshly-built optimizer (strict=False).",
-                    name,
-                    optimizer_dir,
-                )
-                loaded_optimizers[name] = opt
-        return loaded_optimizers
-    else:
-        return _load_single_optimizer_state(optimizer, save_dir)
-
-
-def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> torch.optim.Optimizer:
-    """Load a single optimizer's state from disk."""
-    current_state_dict = optimizer.state_dict()
-    flat_state = load_file(save_dir / OPTIMIZER_STATE)
-    state = unflatten_dict(flat_state)
-
-    # 'state' may be absent for newly created optimizers.
-    if "state" in state:
-        loaded_state_dict = {"state": {int(k): v for k, v in state["state"].items()}}
-    else:
-        loaded_state_dict = {"state": {}}
-
-    if "param_groups" in current_state_dict:
-        param_groups = deserialize_json_into_object(
-            save_dir / OPTIMIZER_PARAM_GROUPS, current_state_dict["param_groups"]
-        )
-        loaded_state_dict["param_groups"] = param_groups
-
-    optimizer.load_state_dict(loaded_state_dict)
-    return optimizer

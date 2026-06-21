@@ -2,8 +2,8 @@
 
 agibot_dual_arm has exactly one task description per task_NNN dir (1-row
 tasks.parquet). The v30 adapter already resolves ``task_index`` → task string
-into ``data["task"]`` (lerobot_base.py:596). Naively reusing that as the
-prediction target creates a pathological loop: the prompt is a generic VLA
+into ``data["task"]``. Naively reusing that as the prediction target creates a
+pathological loop: the prompt is a generic VLA
 template that often substitutes ``task`` as the user-text instruction → the
 model is told the answer in its input.
 
@@ -25,9 +25,10 @@ rewrite reaches the prompt builder.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 
-from transforms.core import DataDict, DataTransformFn
+from src.transforms.core import DataDict, DataTransformFn
 
 
 # Conservative generic prompt; short tokens to keep prefix budget tight.
@@ -85,3 +86,35 @@ class BuildAgiBotSubtaskTransformFn(DataTransformFn):
         if self.rewrite_task:
             data["task"] = self.generic_prompt
         return data
+
+    def hydrate(self, ctx) -> "BuildAgiBotSubtaskTransformFn":
+        # Gate on an EXPLICIT schema identity, not just the presence of an
+        # `annotation.subtask` loss field: gating on the field alone would fire
+        # for ANY schema reusing that field name, clobbering its `task` with the
+        # generic prompt and overwriting its `annotation.subtask`. The
+        # task→subtask backfill + prompt rewrite is AgiBot-specific (one task
+        # description per task dir), so require the AgiBot schema identity.
+        # robot_type / schema_id carry the family tag.
+        schema = ctx.schema
+        _has_subtask_loss = any(
+            getattr(spec, "field", None) == "annotation.subtask"
+            for spec in (schema.annotation_losses or ())
+        )
+        _robot_type = str(getattr(schema, "robot_type", "") or "")
+        _schema_id = str(getattr(schema, "schema_id", "") or "")
+        _is_agibot_schema = (
+            _robot_type.startswith("agibot") or _schema_id.startswith("agibot")
+        )
+        _agibot_enabled = bool(_has_subtask_loss and _is_agibot_schema)
+        t = replace(self, enabled=_agibot_enabled)
+        if _has_subtask_loss and not _is_agibot_schema:
+            logging.info(
+                f"{t.__class__.__name__} left disabled: schema "
+                f"{_schema_id!r} declares annotation.subtask but is not an "
+                f"AgiBot schema — skipping task→subtask backfill/prompt rewrite."
+            )
+        if _agibot_enabled:
+            logging.info(
+                f"Hydrated {t.__class__.__name__} enabled=True ({schema.schema_id})"
+            )
+        return t

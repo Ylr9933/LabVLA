@@ -53,11 +53,11 @@ except ImportError:
     _LIGER_VERSION = (0, 0)
     _LIGER_SWIGLU_NEEDS_MANUAL_PATCH = False
 
-from policies.LabVLA.configuration_labvla import LabVLAConfig
-from policies.LabVLA.dit_action_head import DiTActionHead
-from policies.pretrained import PreTrainedPolicy
-from utils.utils import format_big_number
-from utils.constants import (
+from src.policies.LabVLA.configuration_labvla import LabVLAConfig
+from src.policies.LabVLA.dit_action_head import DiTActionHead
+from src.policies.pretrained import PreTrainedPolicy
+from src.utils.utils import format_big_number
+from src.utils.constants import (
     ACTION,
     OBS_STATE,
     OBS_PREFIX,
@@ -129,7 +129,7 @@ class LabVLAModel(nn.Module):
             )
         else:
             _vlm_cfg = Qwen3VLConfig.from_json_file(_bundled_vlm_cfg)
-            # R1: weightless init leaves embed_tokens random unless it is tied to lm_head
+            # Weightless init leaves embed_tokens random unless it is tied to lm_head
             # (which IS in the checkpoint). Qwen3-VL sets tie_word_embeddings=True; fail
             # loud if a future VLM config disables it.
             assert getattr(_vlm_cfg, "tie_word_embeddings", False), (
@@ -169,7 +169,7 @@ class LabVLAModel(nn.Module):
                     f"falling back to stock Qwen3VLTextMLP (numerically identical, slower)"
                 )
         elif _LIGER_AVAILABLE:
-            from utils.logging_utils import warn_once
+            from src.utils.logging_utils import warn_once
             warn_once(
                 logger,
                 ("liger_swiglu_native_path_assumed", _LIGER_VERSION_STR),
@@ -229,7 +229,7 @@ class LabVLAModel(nn.Module):
 
         # ---- KI head (DiscreteActionHead) — instantiated whenever FAST CE loss is needed ----
         if config.use_fast_tokenizer or config.training_phase == "vlm_pretrain":
-            from policies.LabVLA.ki.ki_head import DiscreteActionHead
+            from src.policies.LabVLA.ki.ki_head import DiscreteActionHead
             self.ki_head = DiscreteActionHead(
                 vocab_size=config.discrete_action_vocab_size,
                 hidden_size=self.vlm_hidden_size,
@@ -275,7 +275,7 @@ class LabVLAModel(nn.Module):
             or (config.training_phase == "posttrain" and config.knowledge_isolation)
         )
         if _trains_fast_representation and not config.pi05_block_attention_mask:
-            from utils.logging_utils import warn_once
+            from src.utils.logging_utils import warn_once
             warn_once(
                 logger,
                 ("pi05_block_attention_mask_off", config.training_phase),
@@ -517,7 +517,7 @@ class LabVLAModel(nn.Module):
         "prefix is one contiguous bidirectional block" spec.
 
         HF's ``create_causal_mask`` early-exits when given a 4D mask and
-        uses it as-is (transformers/masking_utils.py:711). So routing this
+        uses it as-is (transformers/masking_utils.py). So routing this
         mask through ``self.vlm.language_model(attention_mask=...)`` bypasses
         the auto-causal logic entirely.
 
@@ -785,8 +785,8 @@ class LabVLAModel(nn.Module):
 
         State token is prepended at position 0; action tokens occupy positions
         1..chunk_size. With Spirit-style interleaved self-attention enabled in
-        the DiT (``interleave_self_attention=True`` in DiTActionHead, default
-        on 2026-05-13), odd-indexed transformer blocks run self-attention over
+        the DiT (``interleave_self_attention=True`` in DiTActionHead, on by
+        default), odd-indexed transformer blocks run self-attention over
         ``hidden_states`` so the state token and action tokens exchange
         information layer-by-layer. The trailing state-token slice in
         ``_denoise_step`` then drops state's own *output* — but the action
@@ -806,7 +806,7 @@ class LabVLAModel(nn.Module):
     def _denoise_step(self, state, vlm_features, x_t, timestep, vlm_attention_mask=None):
         """Single denoising step: embed suffix -> DiT -> predict velocity v_t.
 
-        State routing (Spirit-clone, 2026-05-13). The DiT's odd-indexed blocks
+        State routing (Spirit-clone). The DiT's odd-indexed blocks
         are now self-attention layers (see ``DiTActionHead.interleave_self_attention``).
         Pipeline:
 
@@ -827,7 +827,7 @@ class LabVLAModel(nn.Module):
              every self-attn layer).
 
         ``vlm_attention_mask`` continues to mask padded VLM positions on the
-        cross-attn path (M2). Self-attn blocks see no mask — all suffix
+        cross-attn path. Self-attn blocks see no mask — all suffix
         positions are valid by construction.
         """
         suffix_embs = self._embed_suffix(state, x_t)  # (B, 1+T, dit_hidden)
@@ -912,17 +912,19 @@ class LabVLAModel(nn.Module):
             # means the DataLoader produced `annotation_weight__*` / partial keys
             # without matching tokens — a plumbing bug. Surface it instead of
             # silently falling back to pure MSE.
-            if annotation_bundle and not getattr(
-                self, "_warned_empty_annotation_bundle", False
-            ):
-                logger.warning(
-                    "_embed_annotations: annotation_bundle has %d keys but "
-                    "no (tokens, mask) pair was extractable. Keys: %s. "
-                    "Silently falling back to MSE-only. "
-                    "(further occurrences suppressed)",
-                    len(annotation_bundle), sorted(annotation_bundle)[:6],
+            if annotation_bundle:
+                # A NON-EMPTY bundle whose keys cannot be paired means the
+                # producing transform/collator drifted (prefix rename, lost
+                # mask, ...). Falling back to pure-MSE would silently disable
+                # annotation supervision for entire batches — fail loud instead.
+                raise ValueError(
+                    f"_embed_annotations: annotation_bundle has "
+                    f"{len(annotation_bundle)} keys but no (tokens, mask) "
+                    f"pair was extractable — keys: "
+                    f"{sorted(annotation_bundle)[:8]}. The annotation key "
+                    f"contract (annotation_tokens__/annotation_mask__/"
+                    f"annotation_weight__) drifted upstream (M52)."
                 )
-                self._warned_empty_annotation_bundle = True
             return None, None, []
         get_in_embed = self.vlm.get_input_embeddings()
         per_field_embs = []
@@ -969,11 +971,11 @@ class LabVLAModel(nn.Module):
         """
         # Use Liger fused linear-cross-entropy instead of `F.linear(.float()) +
         # F.cross_entropy`. The naive path materializes a (B, L_field, V≈152K)
-        # fp32 logits tensor (~9.96 GB at B=64, L=256) that OOMs on an 80 GB H100
-        # alongside the 4.7B-param model; FLCE chunk-fuses matmul + softmax + CE so
-        # the big logits tensor is never created. fp32 numerics are preserved
-        # (lm_head_w cast to fp32 here; FLCE accumulates CE in fp32 internally) —
-        # not bit-identical to F.cross_entropy but fp32-equivalent.
+        # fp32 logits tensor that OOMs on an 80 GB H100 alongside the model; FLCE
+        # chunk-fuses matmul + softmax + CE so the big logits tensor is never
+        # created. fp32 numerics are preserved (lm_head_w cast to fp32; FLCE
+        # accumulates CE in fp32) — fp32-equivalent, not bit-identical to
+        # F.cross_entropy.
         #
         # Must use reduction="sum" (FLCE's reduction="none" backward is
         # incomplete) and apply the weighted mask outside the kernel:
@@ -981,16 +983,14 @@ class LabVLAModel(nn.Module):
         #   - per-sample weight → group rows by equal weight, scale each grouped
         #     loss_sum by its weight, accumulate num/denom manually.
         #
-        # Memory invariant: each FLCE call saves a dense grad_weight tensor shaped
-        # like lm_head (V≈152K, H=2560), ~1.45 GiB fp32. Calling it once per
-        # sample stored O(B) copies and OOM'd at BS=64; grouping rows by
-        # field/weight keeps the common heterogeneous-mixture case to one call per
-        # annotation field.
+        # Each FLCE call saves a dense grad_weight tensor shaped like lm_head
+        # (~1.45 GiB fp32). Calling it once per sample stored O(B) copies and
+        # OOM'd at BS=64; grouping rows by field/weight keeps the common
+        # heterogeneous-mixture case to one call per annotation field.
         #
-        # Import is wrapped with an actionable error: an unconditional import
-        # would ImportError mid-training (after the first non-empty
-        # annotation_bundle) on environments without `liger_kernel`, burning GPU
-        # hours up to that point.
+        # Import is wrapped with an actionable error so a missing `liger_kernel`
+        # fails fast rather than ImportError'ing mid-training on the first
+        # non-empty annotation_bundle.
         try:
             from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
         except ImportError as e:
@@ -1268,6 +1268,23 @@ class LabVLAModel(nn.Module):
         # as vlm_hidden for DiT cross-attn (detached), extract fast portion for CE.
         # This replaces the earlier 2-pass (run VLM, then re-run LM on concat) — same
         # semantics, ~40% less LM compute per step.
+        if fast_action_tokens is None and fast_action_mask is None:
+            # A local batch can legally carry ZERO FAST supervision —
+            # FastActionEncodeTransformFn emits no FAST keys for all-padded
+            # actions (e.g. VQA samples), and the collator only aggregates keys
+            # present in the batch. Mirror the vlm_pretrain missing-FAST
+            # semantics instead of asserting: run the same single-pass with an
+            # empty FAST block (L_fast=0) so the DiT MSE path is unchanged and
+            # CE contributes an exact zero.
+            if not getattr(self, "_warned_ki_no_fast_batch", False):
+                logger.warning(
+                    "[H29] knowledge_isolation=True but this batch carries no "
+                    "FAST tokens (legal for all-VQA/all-padded batches); "
+                    "computing MSE with zero CE for such batches (warned once)."
+                )
+                self._warned_ki_no_fast_batch = True
+            fast_action_tokens = lang_tokens.new_zeros((lang_tokens.shape[0], 0))
+            fast_action_mask = lang_tokens.new_zeros((lang_tokens.shape[0], 0))
         assert fast_action_tokens is not None and fast_action_mask is not None, (
             "knowledge_isolation=True requires FAST tokens in batch "
             "(set use_fast_tokenizer=True in config)"
@@ -1396,7 +1413,12 @@ class LabVLAModel(nn.Module):
         # block is at index (L_state + L_prefix) for length L_ann.
         fast_start = L_state + L_prefix + L_ann - 1
         ce_hidden = last[:, fast_start:fast_start + L_fast, :]
-        ce_loss = self.ki_head.compute_ce_loss(ce_hidden, fast_action_tokens, fast_action_mask)
+        if L_fast == 0:
+            # Zero-FAST batch: no CE targets — keep the KI loss mixing
+            # well-defined with an exact fp32 zero.
+            ce_loss = torch.zeros((), device=last.device, dtype=torch.float32)
+        else:
+            ce_loss = self.ki_head.compute_ce_loss(ce_hidden, fast_action_tokens, fast_action_mask)
 
         out_dict = {
             "mse": mse_per_elem.mean(),
@@ -1954,7 +1976,9 @@ class LabVLAPolicy(PreTrainedPolicy):
             loss_dict = {
                 "loss": loss.item(),
                 "loss_action": loss_action.item(),
-                "loss_mse": (mse.item() if mse.ndim == 0 else mse.mean().item()),
+                # Log the masked, real-action-dim mse_scalar (the value
+                # actually optimized as loss_action), not the unmasked full-32-dim mean.
+                "loss_mse": (mse_scalar.item() if mse_scalar.ndim == 0 else mse_scalar.mean().item()),
             }
             if fast_ce is not None:
                 loss_dict["loss_ce"] = fast_ce.item()

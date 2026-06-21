@@ -1,7 +1,7 @@
 """RoboInter-VQA dataset adapter.
 
 Reads LLaVA-format JSON (image + question + answer) from
-`/all-flash-data/Pretrain_Data/RoboInter-VQA/` and emits LabVLA sample dicts
+`/path/to/pretrain_data/RoboInter-VQA/` and emits LabVLA sample dicts
 that flow through the existing transform chain alongside action samples.
 
 Design choices:
@@ -18,7 +18,7 @@ Design choices:
     support is V2 — requires Qwen3-VL multi-image packing). The adapter
     accepts but ignores extra image paths.
   * Image path resolution: relative to `image_root` (typically
-    `/all-flash-data/Pretrain_Data/RoboInter-VQA`).
+    `/path/to/pretrain_data/RoboInter-VQA`).
   * Conversations format: `[{from: "human" or "huamn", value: ...},
     {from: "gpt", value: ...}]`. Typo "huamn" appears in some val files —
     handled.
@@ -45,7 +45,7 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 
 from src.dataset.adapters.robointer_token_budget import ROBOINTER_BUDGET, RoboInterTokenBudget
-from utils.storage_retry import run_with_storage_retry, storage_path_exists
+from src.utils.storage_retry import run_with_storage_retry, storage_path_exists
 
 
 # Conversations role tags. The dataset has a typo "huamn" in some val files.

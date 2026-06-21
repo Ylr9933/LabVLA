@@ -14,7 +14,7 @@ from typing import Any, Optional, TYPE_CHECKING
 import torch.utils.data
 
 if TYPE_CHECKING:
-    from schema import DatasetSchema
+    from src.schema import DatasetSchema
 
 
 @dataclass
@@ -47,7 +47,7 @@ class DatasetMeta:
         mapping — silently training on raw features with zero normalization.
         """
         if self.schema is None:
-            from schema.errors import SchemaDiscoveryError
+            from src.schema.errors import SchemaDiscoveryError
 
             raise SchemaDiscoveryError(
                 "DatasetMeta.schema is None after adapter construction. "

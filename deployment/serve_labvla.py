@@ -7,13 +7,14 @@ WebSocket protocol, compatible with openpi_client.WebsocketClientPolicy.
 
 Usage:
     python serve_labvla.py \
-        --pretrained_path /all-flash-data/LabVLA_final/outputs/.../checkpoint-30000/pretrained_model \
-        --vlm_path /all-flash-data/vlm/Qwen3-VL-4B-Instruct \
+        --pretrained_path /path/to/outputs/<job>/checkpoint-30000/pretrained_model \
+        --vlm_path Qwen/Qwen3-VL-4B-Instruct \
         --port 8000 --device cuda
 """
 
 import argparse
 import json
+import re
 import logging
 import os
 import sys
@@ -31,18 +32,11 @@ from PIL import Image
 # another clone). LABVLA_ROOT still takes precedence for explicit targeting.
 _DEFAULT_LABVLA_ROOT = str(Path(__file__).resolve().parents[1])
 LABVLA_ROOT = os.environ.get("LABVLA_ROOT", _DEFAULT_LABVLA_ROOT)
-LABVLA_SRC = os.path.join(LABVLA_ROOT, "src")
-if LABVLA_SRC not in sys.path:
-    sys.path.insert(0, LABVLA_SRC)
 if LABVLA_ROOT not in sys.path:
     sys.path.insert(0, LABVLA_ROOT)
 
-DEPLOYMENT_DIR = Path(__file__).resolve().parent
-if str(DEPLOYMENT_DIR) not in sys.path:
-    sys.path.insert(0, str(DEPLOYMENT_DIR))
-
-from labsim_transforms import parse_image_to_uint8_hwc
-from websocket_server import WebsocketPolicyServer
+from deployment.labsim_transforms import parse_image_to_uint8_hwc
+from deployment.websocket_server import WebsocketPolicyServer
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +56,7 @@ class LabVLALabUtopiaPolicy:
     def __init__(
         self,
         pretrained_path: str,
-        vlm_path: str = "/all-flash-data/vlm/Qwen3-VL-4B-Instruct",
+        vlm_path: str = "Qwen/Qwen3-VL-4B-Instruct",
         device: str = "cuda",
         default_prompt: str = "",
         chunk_size: int = 50,
@@ -148,6 +142,7 @@ class LabVLALabUtopiaPolicy:
         # a multi-repo bundle exists, select by training_repo_id; falling through
         # to the first repo's schema would mis-interpret another repo's layout.
         self._schema = None
+        self._effective_vlm_path = None  # L45: resolved at load
         ckpt_dir = Path(pretrained_path)
 
         # 1) Look for the multi-repo bundle first.
@@ -157,6 +152,18 @@ class LabVLALabUtopiaPolicy:
             if cand.exists():
                 with open(cand) as f:
                     multi_schema = json.load(f)
+                # A bundle written by current training always carries the
+                # marker; an unmarked/partial file (failed save, stale copy)
+                # must not shadow the healthy single-schema fallback.
+                if not (isinstance(multi_schema, dict)
+                        and multi_schema.get("_schema") == "multi_repo_v1"):
+                    logger.warning(
+                        "[M112] %s lacks the _schema='multi_repo_v1' marker — "
+                        "ignoring it and falling back to labvla_schema.json.",
+                        cand,
+                    )
+                    multi_schema = None
+                    continue
                 # Drop "_"-prefixed metadata keys from the repo candidate map.
                 # The bundle is written as {"_schema": "multi_repo_v1", **schemas},
                 # so without filtering "_schema" would be advertised as a
@@ -226,6 +233,22 @@ class LabVLALabUtopiaPolicy:
         # action_dim defaults to None: when None, adopt the schema-derived value
         # (auto-derivation); when explicit, cross-check and fail loud on
         # mismatch.
+        # The wire contract was hardwired to camera_1..3_rgb while the
+        # checkpoint schema already carries the real raw camera keys. Derive
+        # slot aliases (unified "...image<i>" <-> slot i) so schema raw keys
+        # are accepted and advertised in metadata.
+        self._camera_slot_aliases = {}
+        for _raw, _unified in ((self._schema.get("image_mapping") or {}).items()):
+            _m = re.search(r"image(\d+)$", str(_unified))
+            if not _m:
+                continue
+            _slot = int(_m.group(1))
+            if 0 <= _slot < 3 and str(_raw) != f"camera_{_slot + 1}_rgb":
+                self._camera_slot_aliases.setdefault(_slot, []).append(str(_raw))
+        if self._camera_slot_aliases:
+            logger.info("[H19] schema camera wire aliases: %s",
+                        {f"slot{k}": v for k, v in sorted(self._camera_slot_aliases.items())})
+
         _cli_action_dim_explicit = action_dim is not None
         _schema_action_dims = self._schema.get("action_dims")
         if _schema_action_dims is not None:
@@ -381,35 +404,24 @@ class LabVLALabUtopiaPolicy:
                     "to a flat single-repo stats file, or re-save the ckpt."
                 )
             expected_keys = list(self._schema["state_keys"]) + list(self._schema["action_keys"])
-            # When norm_stats was saved with the opposite LeRobot column-name
-            # convention (v3 observation.state/action vs v2.1 state/actions),
-            # fill missing schema-side keys from aliases so the strict check
-            # passes. Contents are identical; only the key strings differ.
-            _alias_map = {
-                "state": ("observation.state",),
-                "observation.state": ("state",),
-                "actions": ("action",),
-                "action": ("actions",),
-                "actions_abs": ("action_abs",),
-                "action_abs": ("actions_abs",),
-            }
-            remapped: list[tuple[str, str]] = []
-            for _k in expected_keys:
-                if _k in probe:
-                    continue
-                for _alias in _alias_map.get(_k, ()):
-                    if _alias in probe:
-                        probe[_k] = probe[_alias]
-                        remapped.append((_k, _alias))
-                        break
-            if remapped:
-                logger.info(
-                    "[norm_stats] auto-remapped %d key(s) from LeRobot raw-column "
-                    "aliases: %r. Numerical contents preserved; only the "
-                    "dictionary keys differ between v2.1 (state/actions) and v3 "
-                    "(observation.state/action) conventions.",
-                    len(remapped), remapped,
-                )
+            # norm_stats.json carries only the canonical concatenated entries
+            # (observation.state / action / action_abs). Training builds a
+            # per-schema-key view by slicing them (NormalizeTransformFn.hydrate)
+            # but never persists it, so build the IDENTICAL view here with the same
+            # shared slicer. This makes the guard + denorm resolve every schema key
+            # for non-canonical schemas (oxe_auge, robointer_droid); single-key
+            # schemas (labutopia) get a full-length slice == the canonical entry,
+            # i.e. byte-identical to the previous alias behavior. (delta-mode is the
+            # deployable path; abs is governed by _resolve_action_stat_keys.)
+            from src.transforms.core import expand_canonical_stats_per_key
+            _action_canonical = "action" if self.use_delta_action else "action_abs"
+            probe.update(expand_canonical_stats_per_key(
+                probe,
+                self._schema["state_keys"], self._schema["state_dims"],
+                self._schema["action_keys"], self._schema["action_dims"],
+                _action_canonical,
+                schema_id=self._schema.get("schema_id", ""),
+            ))
             missing = [k for k in expected_keys if k not in probe]
             if missing:
                 raise RuntimeError(
@@ -481,10 +493,10 @@ class LabVLALabUtopiaPolicy:
                     f"does not match training. Re-run "
                     f"`python -m data_process stats ...` and re-save the ckpt."
                 )
-            # R2-S1 fix note: norm_stats.json is the FULL canonical dict saved
-            # by train.py (it carries BOTH 'action' (delta domain) and
-            # 'action_abs' (absolute domain) — the per-key slicing inside
-            # hydrate_all is never persisted). So the domain is NOT ambiguous:
+            # norm_stats.json is the FULL canonical dict saved by train.py (it
+            # carries BOTH 'action' (delta domain) and 'action_abs' (absolute
+            # domain) — the per-key slicing inside hydrate_all is never
+            # persisted). So the domain is NOT ambiguous:
             # `_resolve_action_stat_keys` picks the entry matching
             # use_delta_action, and the authoritative re-check runs after
             # `_load_policy` reconciles action_mode from the ckpt config
@@ -495,11 +507,11 @@ class LabVLALabUtopiaPolicy:
         self._load_policy(pretrained_path, vlm_path)
         logger.info("LabVLA loaded and ready for inference!")
 
-        # R2-S1: authoritative action-stat-domain check. `_load_policy` may
-        # have reconciled use_delta_action from the ckpt config (M-06), so only
-        # NOW do we know the training domain for sure. For abs mode this
-        # raises unless the *_abs entries exist — inverting with delta-domain
-        # stats would mis-scale physical actions (~8x on agibot).
+        # Authoritative action-stat-domain check. `_load_policy` may have
+        # reconciled use_delta_action from the ckpt config, so only NOW do we
+        # know the training domain for sure. For abs mode this raises unless the
+        # *_abs entries exist — inverting with delta-domain stats would
+        # mis-scale physical actions (~8x on agibot).
         if self._norm_stats is not None and self._schema is not None:
             _nm_check = self._unwrap_multi_repo(self._norm_stats)
             if _nm_check is not None:
@@ -512,8 +524,8 @@ class LabVLALabUtopiaPolicy:
 
     def _load_policy(self, pretrained_path: str, vlm_path: str):
         """Load LabVLA model from checkpoint."""
-        from policies.LabVLA.configuration_labvla import LabVLAConfig
-        from policies.LabVLA.modeling_labvla import LabVLAPolicy
+        from src.policies.LabVLA.configuration_labvla import LabVLAConfig
+        from src.policies.LabVLA.modeling_labvla import LabVLAPolicy
 
         # train.py writes config.json under the pretrained_model/ subdir. Reading
         # only the top-level path would fall through to LabVLAConfig defaults
@@ -534,6 +546,7 @@ class LabVLALabUtopiaPolicy:
                     f"(overriding --vlm_path {vlm_path!r})"
                 )
                 vlm_path = str(_cand_dir)
+                self._effective_vlm_path = vlm_path  # L45
                 break
         config_path = None
         for _cand in (ckpt_root / "pretrained_model" / "config.json",
@@ -600,6 +613,16 @@ class LabVLALabUtopiaPolicy:
                     f"{saved_fwd['train_vlm_only']} from CLI."
                 )
 
+            # sample_actions reads config.num_inference_steps; without this the
+            # CLI value only reached metadata (and the legacy no-config branch),
+            # so the reported step count could differ from the actual denoise.
+            if saved_fwd.get("num_inference_steps") != self.num_inference_steps:
+                logger.info(
+                    "[deploy] num_inference_steps: ckpt=%r -> CLI/runtime %r",
+                    saved_fwd.get("num_inference_steps"), self.num_inference_steps,
+                )
+                saved_fwd["num_inference_steps"] = self.num_inference_steps
+
             config = LabVLAConfig(**saved_fwd)
 
             # Fail fast on non-deployable checkpoints. serve_labvla only exposes
@@ -625,11 +648,14 @@ class LabVLALabUtopiaPolicy:
             elif saved_action_mode in ("delta", "abs"):
                 effective_action_mode = saved_action_mode
             else:
-                effective_action_mode = "delta"
-                logger.warning(
-                    "Checkpoint config has no action_mode; using legacy "
-                    "deploy default action_mode='delta'. Pass --action_mode abs "
-                    "for abs-trained legacy checkpoints."
+                # A wrong delta/abs guess flips which stats domain is used AND
+                # whether the current state is added back — physically wrong
+                # actions. Require the operator to say what they trained.
+                raise ValueError(
+                    "Checkpoint config has no action_mode and --action_mode "
+                    "was not given (auto cannot resolve it). Pass "
+                    "--action_mode delta|abs matching how this checkpoint "
+                    "was trained."
                 )
             if (
                 self._use_delta_action_override is not None
@@ -643,6 +669,25 @@ class LabVLALabUtopiaPolicy:
             self.use_delta_action = (effective_action_mode == "delta")
             config.action_mode = effective_action_mode
             self.chunk_size = config.chunk_size
+            # Action stats depend on the chunk horizon — a stats file computed
+            # for another chunk_size silently mis-scales the de-normalized
+            # actions. Verify once the authoritative value is known.
+            if isinstance(self._norm_stats, dict):
+                _stats_cs = self._norm_stats.get("_chunk_size")
+                if _stats_cs is not None and int(_stats_cs) != int(self.chunk_size):
+                    raise RuntimeError(
+                        f"[M115] norm stats were computed for _chunk_size="
+                        f"{_stats_cs} but this checkpoint serves chunk_size="
+                        f"{self.chunk_size} — de-normalization would use the "
+                        f"wrong horizon's distribution. Point --norm_stats_path "
+                        f"at the matching stats file."
+                    )
+                if _stats_cs is None:
+                    logger.warning(
+                        "[M115] norm stats carry no _chunk_size marker (legacy "
+                        "artifact) — cannot verify the stats horizon matches "
+                        "chunk_size=%s.", self.chunk_size,
+                    )
             self.max_state_dim = config.max_state_dim
             self.max_action_dim = config.max_action_dim
             self._tokenizer_max_length = config.tokenizer_max_length
@@ -662,8 +707,7 @@ class LabVLALabUtopiaPolicy:
                 num_inference_steps=self.num_inference_steps,
                 gradient_checkpointing=False,
                 compile_model=False,
-                action_mode=self._action_mode_override
-                or ("delta" if self._use_delta_action_override is not False else "abs"),
+                action_mode=self._resolve_legacy_action_mode(),
             )
             self.use_delta_action = (config.action_mode == "delta")
             self._tokenizer_max_length = config.tokenizer_max_length
@@ -713,6 +757,12 @@ class LabVLALabUtopiaPolicy:
 
         # VLM processor
         from transformers import Qwen3VLProcessor
+        if self._effective_vlm_path is None:
+            self._effective_vlm_path = vlm_path  # L45: external path used
+        logger.info("[L45] effective VLM asset path: %s (%s)",
+                    self._effective_vlm_path,
+                    "checkpoint bundle" if "pretrained_model" in str(self._effective_vlm_path)
+                    else "external --vlm_path")
         self.vlm_processor = Qwen3VLProcessor.from_pretrained(vlm_path)
         self.vision_start_token_id = self.vlm_processor.vision_start_token_id
         self.vision_end_token_id = self.vlm_processor.vision_end_token_id
@@ -771,14 +821,14 @@ class LabVLALabUtopiaPolicy:
     ) -> torch.Tensor:
         """Resize keeping aspect ratio + zero-pad to target size.
 
-        R2-S2 fix: delegate to the TRAINING implementation
+        Delegates to the TRAINING implementation
         (``transforms.utils.resize_with_pad``) instead of carrying a line-by-
-        line copy here. The two were verified numerically identical at the
-        time of the audit (scale=min, round, bilinear align_corners=False,
-        centered zero pad, clamp) — delegation makes future drift impossible.
-        ``LABVLA_SRC`` is already on sys.path (see module header imports).
+        line copy here. The two are numerically identical (scale=min, round,
+        bilinear align_corners=False, centered zero pad, clamp) — delegation
+        makes future drift impossible.
+        ``LABVLA_ROOT`` is already on sys.path (see module header imports).
         """
-        from transforms.utils import resize_with_pad as _train_resize_with_pad
+        from src.transforms.utils import resize_with_pad as _train_resize_with_pad
         return _train_resize_with_pad(image, target_h, target_w, "bilinear")
 
     # ---- norm_stats schema helpers ----
@@ -887,7 +937,7 @@ class LabVLALabUtopiaPolicy:
             q99s.append(np.asarray(entry["q99"], dtype=np.float32).reshape(-1))
         return np.concatenate(q01s), np.concatenate(q99s)
 
-    # R2-S1: norm_stats.json bundles the FULL canonical stats dict — BOTH the
+    # norm_stats.json bundles the FULL canonical stats dict — BOTH the
     # delta-domain "action" entry (what action_mode=delta normalized with) and
     # the absolute-domain "action_abs" entry (what action_mode=abs normalized
     # with). The denormalization inverse MUST read the entry matching the
@@ -903,7 +953,7 @@ class LabVLALabUtopiaPolicy:
 
         delta mode → the schema's own action_keys (delta-domain entries).
         abs mode   → the matching ``*_abs`` entries; fail loud when absent
-        rather than silently inverting with delta-domain stats (R2-S1).
+        rather than silently inverting with delta-domain stats.
         """
         keys = list(self._schema["action_keys"])
         if self.use_delta_action:
@@ -1107,6 +1157,19 @@ class LabVLALabUtopiaPolicy:
         }
         return batch
 
+    def _resolve_legacy_action_mode(self) -> str:
+        """Legacy (no config.json) checkpoints carry no action_mode at all —
+        require an explicit operator choice instead of guessing delta."""
+        if self._action_mode_override is not None:
+            return self._action_mode_override
+        if self._use_delta_action_override is not None:
+            return "delta" if self._use_delta_action_override else "abs"
+        raise ValueError(
+            "Legacy checkpoint (no config.json) and no --action_mode given — "
+            "auto cannot resolve delta vs abs. Pass --action_mode delta|abs "
+            "matching how this checkpoint was trained."
+        )
+
     def infer(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """Run inference on a LabUtopia observation."""
         start_time = time.monotonic()
@@ -1114,28 +1177,61 @@ class LabVLALabUtopiaPolicy:
         prompt = obs.get("prompt", obs.get("language_instruction", self.default_prompt))
         if not prompt:
             prompt = self.default_prompt
+        if not prompt or not str(prompt).strip():
+            # Language is a behavior input — an empty instruction must be an
+            # explicit client error, not a silent hidden-default execution.
+            raise ValueError(
+                "no language instruction: request carries no non-empty "
+                "'prompt'/'language_instruction' and the server has no "
+                "--default_prompt configured"
+            )
 
-        # 3-camera images
+        # 3-camera images; each slot accepts the canonical wire key plus the
+        # checkpoint schema's raw camera key for that slot.
         camera_keys = ["camera_1_rgb", "camera_2_rgb", "camera_3_rgb"]
         images = []
-        for cam_key in camera_keys:
-            if cam_key in obs and obs[cam_key] is not None:
-                images.append(parse_image_to_uint8_hwc(obs[cam_key]))
-            else:
-                images.append(None)
+        for _slot, cam_key in enumerate(camera_keys):
+            _cands = [cam_key] + self._camera_slot_aliases.get(_slot, [])
+            _val = next((obs[k] for k in _cands if obs.get(k) is not None), None)
+            images.append(parse_image_to_uint8_hwc(_val) if _val is not None else None)
 
         valid_images = [img for img in images if img is not None]
         if not valid_images:
-            logger.error("No camera image found in observation!")
-            output_len = self.output_chunk_size or self.chunk_size
-            return {
-                "actions": np.zeros((output_len, self.action_dim)),
-            }
+            # A zero action chunk is a *physical command* (drive to zero pose
+            # in abs mode) that the client cannot distinguish from a real
+            # prediction. Raise instead: websocket_server converts infer
+            # exceptions into an explicit error reply and closes the stream.
+            raise ValueError(
+                "No camera image found in observation — refusing to emit a "
+                "zero action chunk. Check the client's camera keys against "
+                "the checkpoint's camera mapping."
+            )
 
         # Pass None camera slots through (do NOT replace with first_valid):
         # _build_3camera_batch's mask=0 branch must fire for missing slots,
         # matching the training-side `<cam>_mask=0`.
-        state = np.asarray(obs.get("state", np.zeros(self.state_dim)), dtype=np.float32)
+        _state_raw = obs.get("state", obs.get("observation/state"))
+        if _state_raw is None:
+            # A fabricated zero state is not a safe default — it feeds
+            # normalization and (in delta mode) the delta->absolute add-back,
+            # i.e. it becomes part of a physical command. Mirror the camera
+            # guard and fail loud instead.
+            raise ValueError(
+                "Observation is missing 'state' (alias: 'observation/state') — "
+                "refusing to substitute zeros: state participates in "
+                "normalization and delta add-back, so a fabricated state "
+                "would produce a physically wrong action chunk."
+            )
+        state = np.asarray(_state_raw, dtype=np.float32)
+        # Enforce the advertised contract instead of silently consuming a
+        # prefix / zero-padding a wrong-width vector.
+        if state.ndim != 1 or state.shape[0] != int(self.state_dim):
+            raise ValueError(
+                f"bad state shape {state.shape} (expected 1-D length "
+                f"{self.state_dim} per metadata['state_dim'])"
+            )
+        if not np.all(np.isfinite(state)):
+            raise ValueError("state contains non-finite values")
 
         batch = self._build_3camera_batch(images, prompt, state)
 
@@ -1191,7 +1287,7 @@ class LabVLALabUtopiaPolicy:
             aj_mean, aj_std = None, None
             if nm is not None:
                 try:
-                    # R2-S1: abs-mode ckpts must invert with the *_abs entries.
+                    # abs-mode ckpts must invert with the *_abs entries.
                     vals = [nm[k] for k in self._resolve_action_stat_keys(nm)]
                     if all("q01" in v and "q99" in v for v in vals):
                         aj_q01 = np.concatenate(
@@ -1269,11 +1365,9 @@ class LabVLALabUtopiaPolicy:
             state_delta = state_for_add[arm_mask]
             actions[:, arm_mask] = actions[:, arm_mask] + state_delta[np.newaxis, :]
 
-        # Pad to 8 dimensions
-        if actions.shape[-1] < 8:
-            padded = np.zeros((actions.shape[0], 8), dtype=np.float32)
-            padded[:, :actions.shape[-1]] = actions
-            actions = padded
+        # No hardcoded pad-to-8 — the payload width must equal the `action_dim`
+        # advertised in metadata (schema-derived). Extra zero channels on a
+        # legal <8-dim schema would reach robot control.
 
         # Deploy-only horizon ablation: keep the model/checkpoint horizon intact
         # but expose only the first N actions, so shorter client-side execution
@@ -1302,6 +1396,18 @@ class LabVLALabUtopiaPolicy:
             "max_action_dim": self.max_action_dim,
             "num_inference_steps": self.num_inference_steps,
             "num_cameras": 3,
+            # Actual wire contract (fixed 3 slots; aliases derived from the
+            # checkpoint schema) so clients adapt instead of guessing.
+            "camera_keys": ["camera_1_rgb", "camera_2_rgb", "camera_3_rgb"],
+            "camera_key_aliases": {
+                f"camera_{s + 1}_rgb": v
+                for s, v in sorted(getattr(self, "_camera_slot_aliases", {}).items())
+            },
+            "state_keys": ["state", "observation/state"],
+            "action_mode": "delta" if self.use_delta_action else "abs",
+            # Language-input contract.
+            "prompt_required": not bool(self.default_prompt),
+            "default_prompt_set": bool(self.default_prompt),
         }
 
 
@@ -1332,6 +1438,10 @@ _DATA_SEMANTICS_ARGS = (
     "normalize_gripper",
     "gripper_norm_mode",
     "snap_gripper_to_binary",
+    # Gripper geometry: drives the deploy-side snap threshold (0.5*max_width)
+    # and which dim gets snapped — same train/deploy-gap class as the toggles.
+    "gripper_max_width",
+    "gripper_canonical_dim",
 )
 
 
@@ -1354,16 +1464,27 @@ def _load_training_state_args(pretrained_path: str) -> Dict[str, Any] | None:
             # weights_only=False: trusted local training sidecar holding a plain
             # dict of argparse values, not just tensors.
             state = torch.load(str(cand), map_location="cpu", weights_only=False)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "[T6] found %s but could not load it (%s); deploy-time data "
-                "semantics will fall back to CLI defaults.", cand, e,
-            )
-            return None
+        except Exception as e:
+            # An ABSENT sidecar is a legacy checkpoint (fallback ok); a
+            # PRESENT-but-unreadable one means the checkpoint is damaged —
+            # silently reverting to CLI defaults would reopen the train/deploy
+            # distribution gap the sidecar exists to close.
+            raise RuntimeError(
+                f"[T6/M38] {cand} exists but cannot be loaded ({e}). The "
+                "checkpoint's training-semantics sidecar is damaged — refusing "
+                "to silently fall back to CLI-default normalization semantics. "
+                "Repair/regenerate the checkpoint, or delete the sidecar to "
+                "explicitly opt into CLI defaults."
+            ) from e
         saved_args = state.get("args") if isinstance(state, dict) else None
-        if isinstance(saved_args, dict):
-            logger.info("[T6] loaded training-time args from %s", cand)
-            return saved_args
+        if not isinstance(saved_args, dict):
+            raise RuntimeError(
+                f"[T6/M38] {cand} loaded but carries no dict 'args' — damaged "
+                "sidecar; refusing CLI-default fallback (delete the sidecar to "
+                "opt in explicitly)."
+            )
+        logger.info("[T6] loaded training-time args from %s", cand)
+        return saved_args
         return None
     return None
 
@@ -1416,7 +1537,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LabVLA Deployment Server for LabUtopia")
     parser.add_argument("--pretrained_path", type=str, required=True,
                         help="Path to LabVLA checkpoint (e.g. checkpoint-30000 or checkpoint-30000/pretrained_model)")
-    parser.add_argument("--vlm_path", type=str, default="/all-flash-data/vlm/Qwen3-VL-4B-Instruct")
+    parser.add_argument("--vlm_path", type=str, default="Qwen/Qwen3-VL-4B-Instruct")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", type=str, default="cuda")
@@ -1443,10 +1564,13 @@ def parse_args():
                              "delta adds current state back to arm deltas; abs returns "
                              "predicted target poses directly.")
     parser.add_argument("--norm_stats_path", type=str, default=None,
-                        help="Normalization stats path (joint_norm_stats.json)")
+                        help="Override the auto-discovered checkpoint "
+                             "norm_stats.json with a specific stats file")
     parser.add_argument("--robot_type", type=str, default="franka",
-                        help="Robot type for MASK_MAPPING delta mask (e.g., franka, franka_robotiq, aloha)")
-    parser.add_argument("--repo_id", type=str, default=None,
+                        help="Legacy multi-repo norm-stats selection heuristic "
+                             "only; layout/delta-mask comes from the checkpoint "
+                             "schema (use --repo_id for multi-repo checkpoints)")
+    parser.add_argument("--repo_id", "--training_repo_id", type=str, default=None,
                         help="CRIT-02: explicit training repo_id for multi_repo_v1 "
                              "norm_stats selection. Required when the ckpt was trained on "
                              "multiple repos AND robot_type is ambiguous across them; "
@@ -1485,7 +1609,12 @@ def parse_args():
                              "websocket server. Default 4 fits a single-GPU / 1-2 "
                              "client setup; raise only when you have spare GPU memory "
                              "for parallel in-flight inference.")
-    parser.add_argument("--auth_token", type=str, default=os.environ.get("LABVLA_WS_AUTH_TOKEN"),
+    parser.add_argument("--max_inflight", type=int, default=None,
+                        help="Admission-control cap on concurrent in-flight "
+                             "inference requests (L19); default max_workers*2.")
+    parser.add_argument("--auth_token", type=str,
+                        default=os.environ.get("LABVLA_WS_AUTH_TOKEN")
+                        or os.environ.get("AUTH_TOKEN"),
                         help="Bearer token required for websocket upgrades via "
                              "Authorization: Bearer <token>.")
     parser.add_argument("--use_delta_action", choices=["auto", "true", "false"], default="auto",
@@ -1510,6 +1639,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # Surface port/host config errors BEFORE the expensive model load.
+    try:
+        _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _probe.bind((args.host, args.port))
+        _probe.close()
+    except OSError as e:
+        raise SystemExit(
+            f"[M113] cannot bind {args.host}:{args.port} ({e}) — fix the "
+            "listener config before loading the model."
+        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -1518,8 +1658,14 @@ def main():
     )
     # Install DedupeFilter so schema / adapter warn_once calls dedupe.
     try:
-        from utils.logging_utils import install_dedupe_filter
+        from src.utils.logging_utils import install_dedupe_filter
         install_dedupe_filter()
+    except Exception:
+        pass
+    # Flag unrecognized LABVLA_* env vars (typos).
+    try:
+        from src.utils.env_flags import validate_environment
+        validate_environment()
     except Exception:
         pass
 
@@ -1609,6 +1755,7 @@ def main():
         port=args.port,
         metadata=policy.metadata,
         max_workers=args.max_workers,
+        max_inflight=args.max_inflight,
         auth_token=args.auth_token,
         max_message_size=args.max_message_size,
     )

@@ -126,8 +126,17 @@ def try_infer_from_info(
 ) -> Optional[DatasetSchema]:
     """Tier 2 discovery. Returns None if names are too opaque — caller falls back."""
     features = info.get("features") or {}
-    action_feat = features.get("action") or features.get("actions")
-    state_feat = features.get("state") or features.get("observation.state")
+    # Derive the key FIRST, then read the feature from that same key, so dims
+    # and the emitted key always come from the same alias when both
+    # ("action"/"actions", "observation.state"/"state") are present.
+    action_key = "action" if "action" in features else "actions"
+    state_key = "observation.state" if "observation.state" in features else "state"
+    action_feat = features.get(action_key) or features.get(
+        "actions" if action_key == "action" else "action"
+    )
+    state_feat = features.get(state_key) or features.get(
+        "state" if state_key == "observation.state" else "observation.state"
+    )
 
     if not (action_feat and state_feat):
         logger.debug(
@@ -193,11 +202,6 @@ def try_infer_from_info(
         )
         delta_mask = tuple([True] * len(a_names))
         gripper_action_dims = tuple()
-
-    # Determine actual feature keys to use — prefer the exact key we read
-    # (may be 'action' or 'actions' depending on dataset).
-    action_key = "actions" if "actions" in features else "action"
-    state_key = "observation.state" if "observation.state" in features else "state"
 
     action_shape = action_feat.get("shape") or [len(a_names)]
     state_shape = state_feat.get("shape") or [len(s_names)]

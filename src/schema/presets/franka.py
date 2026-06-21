@@ -43,13 +43,12 @@ def _expand_images(
         (e.g. ``camera_1_rgb``), because that is literally the parquet /
         info.json feature name.
 
-    C10/C19 fix: the RHS (target slot) is ALWAYS the fully qualified canonical
-    ``observation.images.imageN`` form, regardless of ``image_prefix``.
-    Previously ``image_prefix=""`` emitted a bare ``image0`` target, which
-    ``schema/validate.py`` rejects (it requires ``observation.images.imageN``),
-    so the resulting schema failed in ``DatasetSchema.__post_init__``. Routing
-    the target through ``expand_camera_target`` keeps the source-side v2.1
-    behavior while producing a validator-accepted target.
+    The RHS (target slot) is ALWAYS the fully qualified canonical
+    ``observation.images.imageN`` form, regardless of ``image_prefix``: a bare
+    ``image0`` target is rejected by ``schema/validate.py`` (which requires
+    ``observation.images.imageN``). Routing the target through
+    ``expand_camera_target`` keeps the source-side v2.1 behavior while
+    producing a validator-accepted target.
     """
     out: dict[str, str] = {}
     for i, cam in enumerate(cams):
@@ -144,7 +143,7 @@ def franka_split(
 
     The ``images`` mapping's target slots may be given either as a short
     ``imageN`` alias or the fully qualified ``observation.images.imageN`` key;
-    both are normalized to the canonical form here (C10/C19).
+    both are normalized to the canonical form here.
     """
     total = sum(action_dims)
     if not (0 <= gripper_action_dim < total):
@@ -154,10 +153,10 @@ def franka_split(
         )
     delta_mask = tuple(i != gripper_action_dim for i in range(total))
     if isinstance(images, dict):
-        # C10/C19 fix: normalize each target slot to the canonical
-        # ``observation.images.imageN`` form so a short ``image0`` RHS (as the
-        # docstring example historically used) does not reach the validator and
-        # get rejected. expand_camera_target also rejects non-imageN aliases.
+        # Normalize each target slot to the canonical
+        # ``observation.images.imageN`` form so a short ``image0`` RHS does not
+        # reach the validator and get rejected. expand_camera_target also
+        # rejects non-imageN aliases.
         image_mapping = {
             raw: expand_camera_target(raw, tgt) for raw, tgt in images.items()
         }

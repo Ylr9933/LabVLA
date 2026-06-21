@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 import abc
 import draccus
 
-from dataset.transforms import ImageTransformsConfig
-from transforms.core import TransformGroup
-from dataset.video_utils import get_safe_default_codec
+from src.dataset.transforms import ImageTransformsConfig
+from src.transforms.core import TransformGroup
+from src.dataset.video_utils import get_safe_default_codec
 
 
 @dataclass
@@ -66,33 +66,3 @@ class DatasetConfig(draccus.ChoiceRegistry, abc.ABC):
             )
 
 
-@dataclass
-class WandBConfig:
-    enable: bool = False
-    # Set to true to disable saving an artifact despite training.save_checkpoint=True
-    disable_artifact: bool = False
-    project: str = "lerobot"
-    entity: str | None = None
-    notes: str | None = None
-    run_id: str | None = None
-    mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
-
-
-@dataclass
-class EvalConfig:
-    n_episodes: int = 50
-    # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
-    batch_size: int = 50
-    # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
-    use_async_envs: bool = False
-
-    def __post_init__(self) -> None:
-        if self.batch_size > self.n_episodes:
-            raise ValueError(
-                "The eval batch size is greater than the number of eval episodes "
-                f"({self.batch_size} > {self.n_episodes}). As a result, {self.batch_size} "
-                f"eval environments will be instantiated, but only {self.n_episodes} will be used. "
-                "This might significantly slow down evaluation. To fix this, you should update your command "
-                f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
-                f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
-            )

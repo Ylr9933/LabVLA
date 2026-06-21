@@ -29,15 +29,15 @@ from huggingface_hub.errors import HfHubHTTPError
 # Keep module-level `CONFIG_NAME` alias for back-compat with any caller that
 # imports `from config.policies import CONFIG_NAME`. New callers should
 # prefer the class-level `PreTrainedConfig.CONFIG_NAME` attribute which can
-# be overridden in subclasses (M-30).
+# be overridden in subclasses.
 CONFIG_NAME = _HF_CONFIG_NAME
 
-from config.types import FeatureType, PolicyFeature
-from optim.optimizers import OptimizerConfig
-from optim.schedulers import LRSchedulerConfig
-from utils.constants import ACTION, OBS_STATE
-from utils.hub import HubMixin
-from utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
+from src.config.types import FeatureType, PolicyFeature
+from src.optim.optimizers import OptimizerConfig
+from src.optim.schedulers import LRSchedulerConfig
+from src.utils.constants import ACTION, OBS_STATE
+from src.utils.hub import HubMixin
+from src.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
@@ -91,7 +91,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             auto_device = auto_select_torch_device()
             # rank_zero_warn_once: only rank 0 emits, and it's safe before
             # torch.distributed is initialized.
-            from utils.logging_utils import rank_zero_warn_once
+            from src.utils.logging_utils import rank_zero_warn_once
             rank_zero_warn_once(
                 logger,
                 ("device_switch", str(self.device), str(auto_device)),

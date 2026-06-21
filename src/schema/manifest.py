@@ -17,9 +17,19 @@ SUPPORTED_VERSION = 1
 def load_manifest(path: str | Path) -> DatasetSchema:
     """Parse and validate a labvla_manifest.json file into a DatasetSchema.
 
-    Raises ValueError on malformed manifests.
+    Raises ValueError on malformed manifests, always citing the manifest path
+    so pre-construction parse errors point at WHICH manifest was broken.
     """
     path = Path(path)
+    try:
+        return _load_manifest_inner(path)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"manifest {path}: {type(e).__name__}: {e}") from e
+
+
+def _load_manifest_inner(path: Path) -> DatasetSchema:
     with open(path) as f:
         data = json.load(f)
 
@@ -39,7 +49,14 @@ def load_manifest(path: str | Path) -> DatasetSchema:
     state = data.get("state") or {}
     action = data.get("action") or {}
     images = data.get("images") or {}
-    allow_extra_cameras = bool(data.get("allow_extra_cameras", False))
+    _aec_raw = data.get("allow_extra_cameras", False)
+    if not isinstance(_aec_raw, bool):
+        raise ValueError(
+            f"manifest allow_extra_cameras must be a JSON boolean, got "
+            f"{_aec_raw!r} (M32: bool('false') is True — truthiness would "
+            f"invert the camera cross-check)"
+        )
+    allow_extra_cameras = _aec_raw
 
     arm_layout = None
     if data.get("arm_layout") is not None:
@@ -59,16 +76,37 @@ def load_manifest(path: str | Path) -> DatasetSchema:
     state_dims = tuple(state.get("dims") or ())
     action_keys = tuple(action.get("keys") or ())
     action_dims = tuple(action.get("dims") or ())
-    delta_mask = tuple(bool(v) for v in (action.get("delta") or ()))
+    _delta_raw = action.get("delta") or ()
+    if not all(isinstance(v, bool) for v in _delta_raw):
+        raise ValueError(
+            f"manifest action.delta must be JSON booleans, got {_delta_raw!r} "
+            f"(M32: truthiness would silently rewrite the delta mask)"
+        )
+    delta_mask = tuple(_delta_raw)
     gripper_action_dims = tuple(action.get("gripper_dims") or ())
     # Optional gripper physical semantic ("width" / "open_fraction" /
     # "position" / ...). Drives gripper canonicalization + cross-repo
     # compatibility guards in dataset_helpers. Absent in legacy manifests
     # → None → registry-based fallback keyed off schema_id still applies.
     gripper_semantic_raw = data.get("gripper_semantic")
-    gripper_semantic = (
-        str(gripper_semantic_raw) if gripper_semantic_raw else None
-    )
+    if gripper_semantic_raw is not None and not isinstance(gripper_semantic_raw, str):
+        raise ValueError(
+            f"manifest gripper_semantic must be a string or absent, got "
+            f"{type(gripper_semantic_raw).__name__} (M32)"
+        )
+    gripper_semantic = gripper_semantic_raw or None
+    # Virtual columns: parse this field explicitly so a manifest that declares
+    # it does not silently drop it and then fail validation with
+    # "virtual. key has no mapping".
+    _vss_raw = data.get("virtual_state_sources") or {}
+    if not isinstance(_vss_raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in _vss_raw.items()
+    ):
+        raise ValueError(
+            f"manifest virtual_state_sources must be a str->str map, got "
+            f"{_vss_raw!r} (M32: no truthiness coercion at the wire boundary)"
+        )
+    virtual_state_sources = dict(_vss_raw)
     source_state = data.get("source_state") or {}
     source_action = data.get("source_action") or {}
     source_state_keys = tuple(source_state.get("keys") or ())
@@ -94,6 +132,7 @@ def load_manifest(path: str | Path) -> DatasetSchema:
             delta_mask=delta_mask,
             gripper_action_dims=gripper_action_dims,
             gripper_semantic=gripper_semantic,
+            virtual_state_sources=virtual_state_sources,
             image_mapping=expanded_images,
             allow_extra_cameras=allow_extra_cameras,
             arm_layout=arm_layout,

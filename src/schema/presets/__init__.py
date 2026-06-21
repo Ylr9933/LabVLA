@@ -2,7 +2,7 @@
 
 Importing these factories keeps schema files short for the common case:
 
-    from schema.presets import franka8
+    from src.schema.presets import franka8
     SCHEMA = franka8("labutopia_level3_press_v1",
                      cams=("camera_1_rgb", "camera_2_rgb", "camera_3_rgb"))
 

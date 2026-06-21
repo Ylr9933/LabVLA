@@ -16,13 +16,14 @@ without annotation_losses incur zero cost.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 
-from schema.annotation_loss import AnnotationLossSpec
-from transforms.core import DataDict, DataTransformFn
+from src.schema.annotation_loss import AnnotationLossSpec
+from src.transforms.core import DataDict, DataTransformFn
 
 
 @DataTransformFn.register_subclass("annotation_tokenize")
@@ -128,3 +129,15 @@ class AnnotationTokenizeTransformFn(DataTransformFn):
                 float(spec.weight), dtype=torch.float32
             )
         return data
+
+    def hydrate(self, ctx) -> "AnnotationTokenizeTransformFn":
+        # Inject this dataset's annotation specs. Empty tuple → no-op path,
+        # zero tokenizer load, zero overhead for OXE-style datasets.
+        t = replace(self, annotation_specs=tuple(ctx.schema.annotation_losses))
+        logging.info(
+            f"Hydrated {t.__class__.__name__} with "
+            f"{len(t.annotation_specs)} annotation_specs "
+            f"dynamic_shape={getattr(t, 'dynamic_shape', False)} "
+            f"({ctx.schema.schema_id})"
+        )
+        return t

@@ -257,14 +257,13 @@ class ImageTransforms(Transform):
             )
         self._base_seed = 0
         self._epoch = 0
-        # R2-D9 fix: per-sample augmentation seeds include the epoch, but the
-        # local `_epoch` int is frozen inside DataLoader worker processes
-        # (fork-time snapshot; with persistent_workers it NEVER updates), so
-        # every epoch re-applied the identical jitter to every sample. A
-        # multiprocessing.Value lives in shared memory: the main process's
-        # set_epoch() write is visible LIVE to all forked workers, persistent
-        # or not. Best-effort — on failure we fall back to the local int
-        # (status quo behavior).
+        # Per-sample augmentation seeds include the epoch, but a local `_epoch`
+        # int is frozen inside DataLoader worker processes (fork-time snapshot;
+        # with persistent_workers it never updates), so every epoch would
+        # re-apply identical jitter to every sample. A multiprocessing.Value
+        # lives in shared memory, so the main process's set_epoch() write is
+        # visible live to all forked workers. Best-effort: on failure we fall
+        # back to the local int.
         try:
             import multiprocessing as _mp
             self._epoch_shared = _mp.Value("i", 0)

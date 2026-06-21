@@ -16,14 +16,15 @@ Output keys added in-place into sample dict:
 """
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 import torch
 
-from transforms.core import DataTransformFn
+from src.transforms.core import DataTransformFn, source_fast_max_length
 
 
 _TOKENIZER_CACHE: dict = {}  # process-local
@@ -32,7 +33,9 @@ _TOKENIZER_CACHE: dict = {}  # process-local
 def _get_tokenizer(path: str, vocab_size: int, max_length: int):
     key = (path, int(vocab_size), int(max_length))
     if key not in _TOKENIZER_CACHE:
-        from policies.LabVLA.ki.fast_tokenizer import FastTokenizerWrapper
+        # Import stays inside the function so merely importing fast_action
+        # doesn't pull transformers/scipy until FAST is actually used.
+        from src.transforms.fast_tokenizer import FastTokenizerWrapper
         _TOKENIZER_CACHE[key] = FastTokenizerWrapper(path, vocab_size, max_length)
     return _TOKENIZER_CACHE[key]
 
@@ -40,11 +43,11 @@ def _get_tokenizer(path: str, vocab_size: int, max_length: int):
 @DataTransformFn.register_subclass("fast_action_encode")
 @dataclass
 class FastActionEncodeTransformFn(DataTransformFn):
-    # R2-M4: library-level default is env-overridable so a relocated FAST asset
-    # doesn't require a code edit (config/launch layers always pass `path`
-    # explicitly; this default only serves ad-hoc/library callers).
+    # Library-level default is env-overridable so a relocated FAST asset doesn't
+    # require a code edit (config/launch layers always pass `path` explicitly;
+    # this default only serves ad-hoc/library callers).
     path: str = os.environ.get(
-        "LABVLA_FAST_TOKENIZER_PATH", "/all-flash-data/Embodied_models/fast"
+        "LABVLA_FAST_TOKENIZER_PATH", "physical-intelligence/fast"
     )
     vocab_size: int = 2048
     max_length: int = 256
@@ -70,7 +73,8 @@ class FastActionEncodeTransformFn(DataTransformFn):
             # reshaped action to 1D/0D, which would silently drop FAST CE
             # supervision while training continues (weaker vlm_pretrain run).
             # Opt out only when intentionally mixing un-chunked action (rare).
-            if os.environ.get("LABVLA_FAST_ACTION_NON_CHUNK_SKIP") == "1":
+            from src.utils import env_flags as _env_flags
+            if _env_flags.get("LABVLA_FAST_ACTION_NON_CHUNK_SKIP") == "1":
                 return data
             raise ValueError(
                 f"FastActionEncodeTransformFn: expected 2-D action chunk "
@@ -140,6 +144,30 @@ class FastActionEncodeTransformFn(DataTransformFn):
         data["fast_action_tokens"] = torch.from_numpy(tokens)
         data["fast_action_mask"] = torch.from_numpy(mask)
         return data
+
+    def hydrate(self, ctx) -> "FastActionEncodeTransformFn":
+        # Tighten the source-local max_length once the dataset schema is known
+        # (source_shape_convergence runs).
+        schema = ctx.schema
+        source_action_dim = int(sum(schema.action_dims or ()))
+        original_max_length = int(self.max_length)
+        effective_max_length = original_max_length
+        if getattr(self, "source_shape_convergence", False):
+            effective_max_length = source_fast_max_length(
+                schema.schema_id,
+                original_max_length,
+            )
+        t = self
+        if effective_max_length != original_max_length:
+            t = replace(self, max_length=effective_max_length)
+        logging.info(
+            f"Hydrated {t.__class__.__name__} max_length={t.max_length} "
+            f"source_action_dim={source_action_dim} "
+            f"trim_to_mask={getattr(t, 'trim_to_mask', False)} "
+            f"source_shape_convergence={getattr(t, 'source_shape_convergence', False)} "
+            f"({schema.schema_id})"
+        )
+        return t
 
 
 @DataTransformFn.register_subclass("drop_fast_action_supervision")

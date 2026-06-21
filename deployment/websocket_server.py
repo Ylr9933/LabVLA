@@ -47,12 +47,34 @@ def _pack_array(obj):
     return obj
 
 
+class BadRequestError(ValueError):
+    """Raised for malformed client messages (wire-contract violations); the
+    handler converts it into a structured `bad_request` reply instead of a
+    generic internal error."""
+
+
 def _unpack_array(obj):
-    """Unpack numpy arrays from msgpack deserialization."""
+    """Unpack numpy arrays from msgpack deserialization (validated)."""
     if b"__ndarray__" in obj:
-        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=obj[b"shape"])
+        try:
+            dtype = np.dtype(obj[b"dtype"])
+            shape = tuple(int(d) for d in obj[b"shape"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise BadRequestError(f"bad ndarray envelope: {e}") from e
+        if any(d < 0 for d in shape):
+            raise BadRequestError(f"bad ndarray envelope: negative shape {shape}")
+        data = obj.get(b"data")
+        expected = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        if not isinstance(data, (bytes, bytearray)) or len(data) != expected:
+            raise BadRequestError(
+                f"bad ndarray envelope: data is {len(data) if isinstance(data, (bytes, bytearray)) else type(data).__name__} "
+                f"bytes but dtype={dtype} shape={shape} needs {expected}")
+        return np.ndarray(buffer=data, dtype=dtype, shape=shape)
     if b"__npgeneric__" in obj:
-        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+        try:
+            return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise BadRequestError(f"bad npgeneric envelope: {e}") from e
     return obj
 
 
@@ -150,14 +172,22 @@ class WebsocketPolicyServer:
             f"(requests beyond this are rejected with error=overload)"
         )
 
-        # websockets 12.x (legacy API) -- compatible with openpi_client
+        # The pinned websockets==16.0 uses the NEW asyncio server API —
+        # process_request receives (connection, request) and must return a
+        # Response. Passing the legacy (path, headers) callback poisons EVERY
+        # handshake (/healthz 502, upgrade fails). Select the callback by
+        # installed major version so older envs still work.
+        _ws_major = int(getattr(websockets, "__version__", "0").split(".")[0] or 0)
+        _process_request = (
+            self._health_check if _ws_major >= 13 else self._health_check_legacy
+        )
         async with websockets.serve(
             self._handler,
             self._host,
             self._port,
             compression=None,
             max_size=self._max_message_size,
-            process_request=self._health_check_legacy,
+            process_request=_process_request,
             ping_interval=300,
             ping_timeout=300,
             close_timeout=60,
@@ -179,7 +209,20 @@ class WebsocketPolicyServer:
 
                 # Step 2a: Receive observation
                 raw_data = await websocket.recv()
-                obs = unpackb(raw_data)
+                try:
+                    obs = unpackb(raw_data)
+                except BadRequestError as e:
+                    await websocket.send(packer.pack(
+                        {"error": "bad_request", "detail": str(e)}))
+                    continue
+                if not isinstance(obs, dict):
+                    # A non-map message would die deep in infer() as an
+                    # internal error; answer with a contract error instead.
+                    await websocket.send(packer.pack(
+                        {"error": "bad_request",
+                         "detail": f"request must be a msgpack map, got "
+                                   f"{type(obs).__name__}"}))
+                    continue
 
                 # Step 2b: Run inference in a thread pool so the event loop isn't
                 # blocked during slow inference and can still answer WebSocket
@@ -209,7 +252,7 @@ class WebsocketPolicyServer:
                 # pool drains below the threshold.
                 self._inflight_count += 1
                 threshold = self._max_workers * 2
-                if self._inflight_count > threshold and not self._backlog_warned:
+                if self._inflight_count >= threshold and not self._backlog_warned:
                     logger.warning(
                         f"[M-27] inference backlog: {self._inflight_count} in-flight "
                         f"> threshold {threshold} (max_workers={self._max_workers}). "
@@ -241,6 +284,15 @@ class WebsocketPolicyServer:
                 if "ConnectionClosed" in type(e).__name__:
                     logger.info(f"Connection from {websocket.remote_address} closed")
                     break
+                if isinstance(e, (BadRequestError, ValueError)):
+                    # Input-contract violations (missing state/camera, bad
+                    # shapes) are CLIENT errors — reply without tearing the
+                    # connection down or logging a server traceback.
+                    logger.warning("bad request from %s: %s",
+                                   websocket.remote_address, e)
+                    await websocket.send(packer.pack(
+                        {"error": "bad_request", "detail": str(e)}))
+                    continue
                 logger.error(f"Error during inference: {traceback.format_exc()}")
                 try:
                     import websockets.frames
@@ -279,7 +331,9 @@ class WebsocketPolicyServer:
             header_value = headers.get("Authorization", "") or ""
         except AttributeError:
             header_value = ""
-        if header_value == f"Bearer {self._auth_token}":
+        # The official openpi-client sends `Authorization: Api-Key <token>`;
+        # accept both so the advertised OpenPI compatibility holds under auth.
+        if header_value in (f"Bearer {self._auth_token}", f"Api-Key {self._auth_token}"):
             return True
         if parse_qs(urlsplit(path).query).get("token"):
             logger.warning(

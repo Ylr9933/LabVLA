@@ -1,6 +1,6 @@
 """Exponential Moving Average (EMA) of model parameters.
 
-Aligned with openpi (`/all-flash-data/openpi/scripts/train.py:169-173`):
+Aligned with openpi:
 
     ema_params = ema_decay * ema_params + (1 - ema_decay) * params
 

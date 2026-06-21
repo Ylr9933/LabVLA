@@ -22,10 +22,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from config.policies import PreTrainedConfig
-from config.types import FeatureType, PolicyFeature
-from dataset.utils import build_dataset_frame
-from utils.constants import ACTION, OBS_STR
+from src.config.policies import PreTrainedConfig
+from src.config.types import FeatureType, PolicyFeature
+from src.utils.constants import ACTION, OBS_STR
 
 
 def populate_queues(

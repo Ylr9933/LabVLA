@@ -7,7 +7,7 @@ Design principle (openpi-aligned, simpler than InternVLA-A1's per-robot mapping)
 - **Dual-arm** data → **14-dim canonical**: left arm at dim 0..5 (6 joints,
   pad if 5-DoF), left gripper at dim 6, right arm at dim 7..12, right
   gripper at dim 13. Matches openpi Aloha's `state[[6, 13]]` gripper
-  indexing (aloha_policy.py:161,186).
+  indexing.
 
 Both layouts are then right-padded to `max_action_dim=32` by
 `PadStateAndActionTransformFn` downstream.
@@ -18,12 +18,8 @@ gripper position throughout its life. This module is the single source
 of truth.
 
 References:
-  - openpi DROID (Franka 7-DoF single-arm, gripper dim 7):
-    /all-flash-data/openpi/src/openpi/policies/droid_policy.py:40
-  - openpi Aloha (dual-arm, grippers at [6, 13]):
-    /all-flash-data/openpi/src/openpi/policies/aloha_policy.py:161,186
-  - ABot gripper binarize at deploy:
-    /all-flash-data/ABot-Manipulation/ABot/model/framework/base_framework.py:189
+  - openpi DROID (Franka 7-DoF single-arm, gripper dim 7).
+  - openpi Aloha (dual-arm, grippers at [6, 13]).
 """
 from __future__ import annotations
 
@@ -108,10 +104,10 @@ class ArmLayoutSpec:
     def to_dict(self) -> dict:
         """Serialize to JSON-friendly dict for labvla_manifest.json.
 
-        HIGH-21: ``gripper_binarize_threshold`` is always emitted (even when
-        equal to the default) so the on-disk record is self-describing —
-        consumers downstream (e.g. deploy) should read the threshold from
-        the schema rather than assume a hard-coded 0.5.
+        ``gripper_binarize_threshold`` is always emitted (even when equal to
+        the default) so the on-disk record is self-describing — consumers
+        downstream (e.g. deploy) read the threshold from the schema rather
+        than assume a hard-coded 0.5.
         """
         base: dict = {"arm_count": self.arm_count.value}
         if self.arm_count == ArmCount.SINGLE:
@@ -233,48 +229,6 @@ def reverse_map_single(
 
 # ====================== Dual-arm forward / reverse ======================
 # Used by dual-arm schema canonicalization (AgiBot/Aloha-style layouts).
-
-def forward_map_dual(
-    raw_left_arm: np.ndarray,
-    raw_left_gripper: np.ndarray,
-    raw_right_arm: np.ndarray,
-    raw_right_gripper: np.ndarray,
-    left_arm_dof: int,
-    right_arm_dof: int,
-) -> np.ndarray:
-    """Assemble 14-dim canonical from per-component raw arrays.
-
-    Canonical layout:
-        dim 0..5  = left arm (pad 0 at dim 5 if left_arm_dof=5)
-        dim    6  = left gripper
-        dim 7..12 = right arm (pad 0 at dim 12 if right_arm_dof=5)
-        dim   13  = right gripper
-
-    Note: the 14-dim canonical reserves six joint slots per side. Aloha
-    6-DoF × 2 fits directly; AgiBot-style 7-DoF × 2 inputs are accepted by
-    explicitly keeping joints 0..5 on each side and dropping joint 6.
-    """
-    if left_arm_dof not in (5, 6, 7) or right_arm_dof not in (5, 6, 7):
-        raise ValueError(
-            f"dual-arm canonical 14-dim requires 5, 6, or 7 DoF per arm, "
-            f"got left={left_arm_dof} right={right_arm_dof}"
-        )
-    left_arm = np.asarray(raw_left_arm)
-    right_arm = np.asarray(raw_right_arm)
-    left_g = np.asarray(raw_left_gripper)
-    right_g = np.asarray(raw_right_gripper)
-
-    out_shape = left_arm.shape[:-1] + (DUAL_ARM_CANONICAL_DIM,)
-    out = np.zeros(out_shape, dtype=left_arm.dtype)
-
-    left_keep = min(left_arm_dof, 6)
-    right_keep = min(right_arm_dof, 6)
-    out[..., :left_keep] = left_arm[..., :left_keep]
-    out[..., 6] = left_g[..., 0] if left_g.ndim > 0 else left_g
-    out[..., 7:7 + right_keep] = right_arm[..., :right_keep]
-    out[..., 13] = right_g[..., 0] if right_g.ndim > 0 else right_g
-    return out
-
 
 def reverse_map_dual(
     canonical: np.ndarray,

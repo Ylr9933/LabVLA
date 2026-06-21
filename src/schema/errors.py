@@ -6,15 +6,9 @@ inherit from the semantically appropriate built-in (`ValueError` /
 `RuntimeError`) so pre-existing `except ValueError` / `except RuntimeError`
 code paths in the codebase keep working — this is backward-compat by design.
 
-Historical note
----------------
-Before Plan-B unification:
-  - `SchemaDiscoveryError` lived in `schema/dataset_schema.py` as a
-    `RuntimeError` subclass.
-  - `SchemaSpecError` lived in `schema/registry.py` as a `ValueError`
-    subclass.
-Both are now re-exported from those modules for backward compat, but the
-canonical definition is here.
+`SchemaDiscoveryError` and `SchemaSpecError` are re-exported from
+`schema/dataset_schema.py` and `schema/registry.py` respectively for backward
+compat, but the canonical definitions live here.
 """
 
 from __future__ import annotations
@@ -46,9 +40,8 @@ class SchemaDiscoveryError(SchemaError, RuntimeError):
     """Raised when schema discovery fails (manifest missing, info.json
     opaque, image_mapping mismatched, etc.).
 
-    Multiple inheritance with `RuntimeError` preserves the pre-Plan-B
-    contract — `schema/dataset_schema.py` previously defined this as a
-    `RuntimeError` subclass, and adapters catch it explicitly.
+    Multiple inheritance with `RuntimeError` preserves backward compat —
+    adapters catch it explicitly via either type.
     """
 
 
@@ -56,9 +49,8 @@ class SchemaSpecError(SchemaError, ValueError):
     """Raised by `schema.registry.resolve(spec)` when `spec` cannot be
     mapped to any registered schema / dotted module / file path.
 
-    Multiple inheritance with `ValueError` preserves the pre-Plan-B
-    contract — `schema/registry.py` previously defined this as a
-    `ValueError` subclass.
+    Multiple inheritance with `ValueError` preserves backward compat for
+    callers that catch `ValueError`.
     """
 
 

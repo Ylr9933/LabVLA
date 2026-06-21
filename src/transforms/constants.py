@@ -7,7 +7,7 @@ mechanism is now replaced by:
 
   - per-dataset `meta/labvla_manifest.json` (preferred)
   - auto-inference from `info.json` `features[*].names`
-  - `src/robots/*.py` `RobotConfig` registry (last-resort fallback)
+  - (historical) robot-config registry fallback — module since removed
 
 all unified under `src/schema/` (`DatasetSchema` + `discover_schema`).
 

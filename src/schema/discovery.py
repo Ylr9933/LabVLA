@@ -60,13 +60,12 @@ def _load_info_json(root: Path) -> Optional[dict]:
 def _validate_annotation_fields(schema, info: dict, root: Path) -> None:
     """Fail loud on an annotation-loss field that references a non-existent column.
 
-    T16: ``annotation_losses`` previously only had its type/duplicate checks in
-    ``validate_schema``; a typo'd ``field`` (e.g. ``annotation.vqa_anwser``)
-    sailed through, then tokenization read ``data.get(field, "")`` → empty
-    string → all-zero mask → silent 0-CE, so the annotation supervision was
-    effectively off while training "succeeded". Here, once info.json is
-    available, we reject a field that is neither a known transform-synthesized
-    field nor present in info.json ``features``.
+    A typo'd ``field`` (e.g. ``annotation.vqa_anwser``) would otherwise pass
+    the type/duplicate checks in ``validate_schema``, then tokenization reads
+    ``data.get(field, "")`` → empty string → all-zero mask → silent 0-CE, so
+    the annotation supervision is effectively off while training "succeeds".
+    Here, once info.json is available, we reject a field that is neither a
+    known transform-synthesized field nor present in info.json ``features``.
 
     Note: the authoritative runtime guard (warn-once when a configured field is
     absent from the *materialized* sample dict) belongs in the tokenize
@@ -79,12 +78,52 @@ def _validate_annotation_fields(schema, info: dict, root: Path) -> None:
     features = info.get("features") or {}
     feature_keys = set(features.keys()) if isinstance(features, dict) else set()
     missing = []
+    bad_producer = []
+    _rt = str(getattr(schema, "robot_type", "") or "").lower()
+    _sid = str(getattr(schema, "schema_id", "") or "").lower()
     for spec in losses:
         field = getattr(spec, "field", None)
-        if not field or field in _SYNTHESIZED_ANNOTATION_FIELDS:
+        if not field:
+            continue
+        if field in _SYNTHESIZED_ANNOTATION_FIELDS:
+            # A legal synthesized field name on the WRONG producer family
+            # passes this whitelist but no transform ever materializes it —
+            # annotation CE then trains on empty text with an all-zero mask.
+            # Bind each synthesized field to the family whose transform/adapter
+            # actually produces it.
+            if field == "annotation.subtask" and not (
+                _rt.startswith("agibot") or _sid.startswith("agibot")
+            ):
+                bad_producer.append(
+                    f"{field}: only AgiBot schemas have the task→subtask "
+                    f"backfill producer (BuildAgiBotSubtaskTransformFn gates "
+                    f"on robot_type/schema_id 'agibot*'; this schema is "
+                    f"{schema.schema_id!r})"
+                )
+            elif field == "annotation.vqa_answer" and "vqa" not in _sid and "vqa" not in _rt:
+                bad_producer.append(
+                    f"{field}: only the VQA adapter writes this field; "
+                    f"schema {schema.schema_id!r} is not a VQA schema"
+                )
+            elif field == "annotation.unified":
+                _raw_ann = [k for k in feature_keys
+                            if k.startswith("annotation.")
+                            and k not in _SYNTHESIZED_ANNOTATION_FIELDS]
+                if not _raw_ann:
+                    bad_producer.append(
+                        f"{field}: dataset exposes no raw annotation.* "
+                        f"columns for BuildUnifiedAnnotationTransformFn to "
+                        f"consume — the unified text would always be empty"
+                    )
             continue
         if field not in feature_keys:
             missing.append(field)
+    if bad_producer:
+        raise SchemaDiscoveryError(
+            f"[schema] schema_id={schema.schema_id!r} declares runtime-"
+            f"synthesized annotation field(s) without a matching producer "
+            f"(H16): " + "; ".join(bad_producer)
+        )
     if missing:
         raise SchemaDiscoveryError(
             f"[schema] schema_id={schema.schema_id!r} declares annotation_losses "
@@ -100,11 +139,11 @@ def _validate_annotation_fields(schema, info: dict, root: Path) -> None:
 def _warn_if_image_mapping_missing(schema, root: Path) -> None:
     """Raise SchemaDiscoveryError if manifest image keys don't match info.json.
 
-    Forward direction (M-9 fix): any schema image key absent from info.json
-    features is a hard error — the dataset doesn't carry what we promised.
+    Forward direction: any schema image key absent from info.json features is
+    a hard error — the dataset doesn't carry what we promised.
 
-    Reverse direction (M-5 add): any video feature in info.json that the
-    schema doesn't map to an image slot is a hard error too. A dataset with
+    Reverse direction: any video feature in info.json that the schema doesn't
+    map to an image slot is a hard error too. A dataset with
     3 cameras but a manifest that only declares 1 would silently drop 2
     modalities during training, producing a ckpt that at deploy time expects
     1 camera while the robot hardware sends 3 — classic silent skew.
@@ -115,10 +154,10 @@ def _warn_if_image_mapping_missing(schema, root: Path) -> None:
         with open(root / "meta" / "info.json") as _f:
             info = _json.load(_f)
         features = info.get("features", {})
-        # Apr-2026 fix: schema.image_mapping LHS is now uniformly the
-        # canonical ``observation.images.<x>`` form (Fix 1 — both halves
-        # of expand_camera_mapping). info.json features still use whatever
-        # the source dataset declares (v3.0: prefixed; v2.1: often raw
+        # schema.image_mapping LHS is uniformly the canonical
+        # ``observation.images.<x>`` form (both halves of
+        # expand_camera_mapping). info.json features still use whatever the
+        # source dataset declares (v3.0: prefixed; v2.1: often raw
         # ``camera_1_rgb``). Build a reverse lookup so the same physical
         # camera is recognized under either spelling.
         feature_canonical = {_expand_src(k): k for k in features.keys()}
@@ -150,10 +189,10 @@ def _warn_if_image_mapping_missing(schema, root: Path) -> None:
                 if not isinstance(entry, dict):
                     continue
                 dtype = entry.get("dtype", "")
-                # Apr-2026: v2.1 datasets set dtype="image" with raw key
-                # like "camera_1_rgb"; v3.0 sets dtype="image" with the
-                # prefixed "observation.images.camera_1_rgb". Both shapes
-                # are valid camera features for the reverse check.
+                # v2.1 datasets set dtype="image" with a raw key like
+                # "camera_1_rgb"; v3.0 sets dtype="image" with the prefixed
+                # "observation.images.camera_1_rgb". Both shapes are valid
+                # camera features for the reverse check.
                 is_camera = dtype == "video" or dtype == "image"
                 if not is_camera:
                     continue
@@ -177,7 +216,12 @@ def _warn_if_image_mapping_missing(schema, root: Path) -> None:
     except SchemaDiscoveryError:
         raise
     except Exception as e:
-        logger.debug("_warn_if_image_mapping_missing: skipped (%s)", e)
+        # This is the only camera/manifest cross-check; swallowing it at debug
+        # level would hide a corrupt info.json entirely.
+        logger.warning(
+            "_warn_if_image_mapping_missing: camera cross-check skipped (%s) "
+            "— info.json may be unreadable/corrupt.", e
+        )
 
 
 def discover_schema(

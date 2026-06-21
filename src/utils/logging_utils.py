@@ -1,25 +1,24 @@
 """Centralized warn-once / dedup logging utilities.
 
-HIGH-27 + M-32: replaces ad-hoc module-level `_WARNED_*` sets throughout the
-codebase with a single `logging.Filter` that deduplicates by
-``(logger_name, dedup_key)``.
+Replaces ad-hoc module-level `_WARNED_*` sets throughout the codebase with a
+single `logging.Filter` that deduplicates by ``(logger_name, dedup_key)``.
 
 Usage
 -----
 At process startup (train.py / serve_labvla.py / data_process/cli.py)::
 
-    from utils.logging_utils import install_dedupe_filter
+    from src.utils.logging_utils import install_dedupe_filter
     install_dedupe_filter()          # attaches to root logger
 
 At warning sites::
 
-    from utils.logging_utils import warn_once
+    from src.utils.logging_utils import warn_once
     warn_once(logger, ("repo_col", repo_id, tuple(cols)),
               "dropped %d eps lacking %s", n, cols)
 
 For distributed training (rank-0 only)::
 
-    from utils.logging_utils import rank_zero_warn_once
+    from src.utils.logging_utils import rank_zero_warn_once
     rank_zero_warn_once(logger, "device_switch",
                         "Device %r unavailable; switching to %r", dev, alt)
 

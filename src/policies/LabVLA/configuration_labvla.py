@@ -6,23 +6,22 @@
 
 from dataclasses import dataclass, field, replace
 
-from config.default import DatasetConfig
-from config.policies import PreTrainedConfig
-from config.types import FeatureType, NormalizationMode, PolicyFeature
-from optim.optimizers import AdamWConfig, LabVLAAdamWConfig
-from utils.constants import OBS_IMAGES
-from transforms.core import *
-from transforms.annotation_tokenize import AnnotationTokenizeTransformFn
-from transforms.build_unified_annotation import BuildUnifiedAnnotationTransformFn
-from transforms.agibot_subtask import BuildAgiBotSubtaskTransformFn
-from policies.LabVLA.transform_labvla import Qwen3_VLProcessorTransformFn, UnifyLabVLAInputsTransformFn
+from src.config.default import DatasetConfig
+from src.config.policies import PreTrainedConfig
+from src.config.types import FeatureType, NormalizationMode, PolicyFeature
+from src.optim.optimizers import AdamWConfig, LabVLAAdamWConfig
+from src.utils.constants import OBS_IMAGES
+from src.transforms.core import *
+from src.transforms.annotation_tokenize import AnnotationTokenizeTransformFn
+from src.transforms.build_unified_annotation import BuildUnifiedAnnotationTransformFn
+from src.transforms.agibot_subtask import BuildAgiBotSubtaskTransformFn
+from src.transforms.vlm_processor import Qwen3_VLProcessorTransformFn, UnifyLabVLAInputsTransformFn
 
 
-# R2-S3: single source of truth for the non-discretized task-prompt token
-# budget. Previously this lived as a hardcoded `48` inside
-# LabVLADatasetConfig.__post_init__ (training-side processor) AND as an
-# independent `tokenizer_max_length: int = 48` field on LabVLAConfig
-# (deploy-side reader) — editing one silently desynced train vs serve.
+# Single source of truth for the non-discretized task-prompt token budget,
+# shared by the training-side processor (LabVLADatasetConfig.__post_init__) and
+# the deploy-side reader (LabVLAConfig.tokenizer_max_length) so the two can't
+# silently desync between train and serve.
 DEFAULT_TOKENIZER_MAX_LENGTH = 48
 
 
@@ -111,7 +110,7 @@ class LabVLADatasetConfig(DatasetConfig):
                 pretrained_model_name_or_path=self.vlm_pretrained_path,
                 max_length=(
                     self.tokenizer_max_length_with_discretized_state
-                    if do_discretize else DEFAULT_TOKENIZER_MAX_LENGTH  # R2-S3
+                    if do_discretize else DEFAULT_TOKENIZER_MAX_LENGTH
                 ),
             )
             normalize_xform = NormalizeTransformFn(mode="mean_std")
@@ -142,7 +141,7 @@ class LabVLADatasetConfig(DatasetConfig):
             # hydrate_all when schema declares annotation.subtask in annotation_losses).
             agibot_subtask = BuildAgiBotSubtaskTransformFn()
             if do_discretize:
-                from transforms.state_discretize import DiscretizeStateTransformFn
+                from src.transforms.state_discretize import DiscretizeStateTransformFn
                 from src.dataset.adapters.robointer_token_budget import ROBOINTER_BUDGET
                 # Order: ... → AgibotSubtask → Normalize → Discretize →
                 # BuildUnifiedAnno → Qwen3VL processor → AnnotationTokenize → ...
@@ -227,7 +226,7 @@ class LabVLADatasetConfig(DatasetConfig):
         # sequence and pollutes the CE signal (up to 24 of 32 dims are zeros for
         # robointer_droid).
         if self.use_fast_tokenizer:
-            from transforms.fast_action import FastActionEncodeTransformFn
+            from src.transforms.fast_action import FastActionEncodeTransformFn
             has_fast = any(isinstance(t, FastActionEncodeTransformFn) for t in inputs)
             if not has_fast:
                 # Find the Pad transform; insert FAST immediately before it.
@@ -348,8 +347,8 @@ class LabVLAConfig(PreTrainedConfig):
     # optimizer-step units or set this True.
     scheduler_allow_auto_scale: bool = False
 
-    # R2-S3: deploy-side readers (serve_labvla) consume this field; the
-    # training-side processor budget comes from the SAME module constant via
+    # Deploy-side readers (serve_labvla) consume this field; the training-side
+    # processor budget comes from the SAME module constant via
     # LabVLADatasetConfig.__post_init__, so the two can no longer drift.
     tokenizer_max_length: int = DEFAULT_TOKENIZER_MAX_LENGTH
 
@@ -432,9 +431,17 @@ class LabVLAConfig(PreTrainedConfig):
         if self.n_action_steps > self.chunk_size:
             self.n_action_steps = self.chunk_size
 
-        # Double GC (both VLM towers) is allowed: benchmarked 2026-06-11 at bs24,
-        # both-tower GC matches single-tower step time (+87% vs +90/94% over no-GC,
-        # within run variance) and gives the lowest peak memory (44.8 vs 53.6 GB).
+        # Double gradient checkpointing is a HARD RULE violation (~2x step time).
+        if (
+            self.gradient_checkpointing
+            and self.gc_visual_encoder
+            and self.gc_language_model
+        ):
+            raise ValueError(
+                "HARD RULE: gc_visual_encoder=True and gc_language_model=True cannot "
+                "both be enabled when gradient_checkpointing=True — double-GC causes "
+                "~2× per-step time. Pick exactly one. See CLAUDE.md for details."
+            )
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
         # train_expert_only freezes the VLM and train_vlm_only freezes the DiT +

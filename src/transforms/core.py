@@ -12,10 +12,10 @@ import torchvision
 import torch.nn.functional as F
 import numpy as np
 
-from transforms.utils import resize_with_pad, resize_center_crop
-from utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE, ACTION, NUM_IMAGE_SLOTS
+from src.transforms.utils import resize_with_pad, resize_center_crop
+from src.utils import env_flags as _env_flags  # registered LABVLA_* flags
+from src.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE, ACTION, NUM_IMAGE_SLOTS
 
-# Legacy dict imports deliberately removed in Phase 4.
 # All hydration goes through hydrate_all() with a DatasetSchema.
 
 
@@ -51,16 +51,15 @@ def _dual_arm_canonical_indices(
     per canonical slot:
       0..5  left joints, 6 left gripper, 7..12 right joints, 13 right gripper.
 
-    R2-D13 fix: sub-6-DoF arms produce zero-pad canonical slots with NO raw
-    index — those entries are ``None`` (sentinel stats are substituted by the
-    caller, mirroring the single-arm path). The old version simply omitted
-    them, returning a SHORT index list that silently produced stats arrays
-    narrower than the canonical 14 dims.
+    Sub-6-DoF arms produce zero-pad canonical slots with NO raw index — those
+    entries are ``None`` (sentinel stats are substituted by the caller,
+    mirroring the single-arm path), so the index list always has the canonical
+    14-dim width rather than silently producing narrower stats arrays.
     """
     if layout is None:
         return None
     try:
-        from schema.arm_layout import ArmCount
+        from src.schema.arm_layout import ArmCount
     except Exception:
         return None
     if getattr(layout, "arm_count", None) != ArmCount.DUAL:
@@ -103,9 +102,9 @@ def _canonicalize_dual_arm_stats(stats: dict | None, schema) -> dict | None:
     if state_idx is None and action_idx is None:
         return stats
 
-    # Sentinel stats for zero-pad canonical slots (R2-D13; mirrors the
-    # single-arm path): std=1 avoids div-by-zero in mean_std, q01=-1/q99=+1
-    # maps the constant 0 input to a stable normalized 0.
+    # Sentinel stats for zero-pad canonical slots (mirrors the single-arm
+    # path): std=1 avoids div-by-zero in mean_std, q01=-1/q99=+1 maps the
+    # constant 0 input to a stable normalized 0.
     _SENTINEL = {"mean": 0.0, "std": 1.0, "q01": -1.0, "q99": 1.0}
 
     def _remap_entry(entry: dict, indices: "list[int | None] | None") -> dict:
@@ -128,8 +127,8 @@ def _canonicalize_dual_arm_stats(stats: dict | None, schema) -> dict | None:
             new = []
             for idx in indices:
                 if idx is None:
-                    # R2-D13: zero-pad slot — no raw index to copy; substitute
-                    # the neutral sentinel so the output keeps canonical width.
+                    # zero-pad slot — no raw index to copy; substitute the
+                    # neutral sentinel so the output keeps canonical width.
                     new.append(float(_SENTINEL.get(stat_name, 0.0)))
                 else:
                     new.append(float(arr[idx]))
@@ -149,6 +148,7 @@ def _canonicalize_dual_arm_stats(stats: dict | None, schema) -> dict | None:
 
 
 _LAYOUT_CANON_MARKER = "_layout_canonicalization"
+_WARNED_LEGACY_LAYOUT_MARKER = False
 _GRIPPER_CANON_MARKER = "_gripper_canonicalization"
 
 
@@ -173,18 +173,56 @@ def _canonicalize_single_arm_stats(stats: dict | None, schema) -> dict | None:
       - schema has no ``source_state_keys`` (raw == canonical already, no
         remap needed; e.g. Franka 8-dim)
       - stats already carry ``_layout_canonicalization`` marker (pre-canonicalized
-        on disk by a stats canonicalization tool).
+        on disk by an offline stats-canonicalization tool).
     """
     if not stats or schema is None:
         return stats
     # Idempotency: skip if stats were already layout-canonicalized on disk.
-    if stats.get(_LAYOUT_CANON_MARKER):
+    # The marker is trusted as a behavior switch, so a structured (dict) marker
+    # must match the ACTIVE schema's identity and source geometry; a mismatched
+    # sidecar fails loud instead of silently feeding wrong-layout quantiles to
+    # normalization. Legacy boolean markers (pre-binding artifacts on disk) are
+    # accepted with a one-time warning.
+    _marker = stats.get(_LAYOUT_CANON_MARKER)
+    if _marker:
+        if isinstance(_marker, dict):
+            _mk_sid = _marker.get("schema_id")
+            if _mk_sid and _mk_sid != str(getattr(schema, "schema_id", "")):
+                raise ValueError(
+                    f"[stats] _layout_canonicalization marker was produced for "
+                    f"schema_id={_mk_sid!r} but the active schema is "
+                    f"{getattr(schema, 'schema_id', None)!r} — refusing to "
+                    f"trust pre-canonicalized stats across schemas (H26)."
+                )
+            for _fld, _attr in (("source_state_dims", "source_state_dims"),
+                                ("source_action_dims", "source_action_dims")):
+                _mk_v = _marker.get(_fld)
+                _cur = [int(d) for d in (getattr(schema, _attr, ()) or ())]
+                if _mk_v is not None and list(_mk_v) != _cur:
+                    raise ValueError(
+                        f"[stats] _layout_canonicalization marker {_fld}="
+                        f"{_mk_v} does not match the active schema's "
+                        f"{_cur} (schema_id={schema.schema_id!r}) — the "
+                        f"sidecar was computed for a different source "
+                        f"layout (H26)."
+                    )
+        else:
+            global _WARNED_LEGACY_LAYOUT_MARKER
+            if not _WARNED_LEGACY_LAYOUT_MARKER:
+                logging.getLogger(__name__).warning(
+                    "[stats] legacy boolean _layout_canonicalization marker "
+                    "(no schema/geometry binding) — accepted for backward "
+                    "compatibility; regenerate stats with the current "
+                    "`python -m data_process stats` to get a bound marker "
+                    "(H26). Warned once."
+                )
+                _WARNED_LEGACY_LAYOUT_MARKER = True
         return stats
     layout = getattr(schema, "arm_layout", None)
     if layout is None:
         return stats
     try:
-        from schema.arm_layout import ArmCount
+        from src.schema.arm_layout import ArmCount
     except Exception:
         return stats
     if getattr(layout, "arm_count", None) != ArmCount.SINGLE:
@@ -257,6 +295,16 @@ class DataTransformFn(draccus.ChoiceRegistry, abc.ABC):
     @abc.abstractmethod
     def __call__(self, data: DataDict) -> DataDict: ...
 
+    def hydrate(self, ctx: "HydrateContext") -> "DataTransformFn":
+        """Return a schema/stats-hydrated copy of self (default: unchanged).
+
+        Called once per transform in chain order; implementations may READ AND
+        UPDATE ``ctx.stats`` (``GripperSemanticCanonicalizeFn`` rewrites
+        gripper-dim stats that downstream Normalize/Snap hydration must
+        observe). Transforms with no schema needs simply inherit this no-op.
+        """
+        return self
+
 
 @dataclass(frozen=True)
 class TransformGroup:
@@ -319,13 +367,11 @@ class GripperSemanticCanonicalizeFn(DataTransformFn):
     """Convert gripper dim from source semantic (width / position) to the
     canonical continuous ``open_fraction`` ∈ [0, 1] target.
 
-    STATUS (R2-M5, audit 20260610): this transform is currently DORMANT — it
-    is intentionally NOT inserted into any chain (see
-    configuration_labvla.py base_inputs comment: q01/q99 normalization already
-    aligns width/open_fraction sources, and per-robot calibration for
-    UR/Festo/Rizon4 is unknown). The hydrate_all branch + the stats
-    canonicalizer below are maintained (and R2-D8-fixed) so the transform is
-    correct if re-enabled with proper calibration entries.
+    This transform is currently DORMANT — it is intentionally NOT inserted
+    into any chain (q01/q99 normalization already aligns width/open_fraction
+    sources, and per-robot calibration for UR/Festo/Rizon4 is unknown). The
+    hydrate branch and the stats canonicalizer below are maintained so the
+    transform is correct if re-enabled with proper calibration entries.
 
     Mathematical mapping:
         open_fraction = clip((x - closed) / (open - closed), 0, 1)
@@ -377,6 +423,78 @@ class GripperSemanticCanonicalizeFn(DataTransformFn):
             data[key] = new_tensor
         return data
 
+    def hydrate(self, ctx: "HydrateContext") -> "GripperSemanticCanonicalizeFn":
+        # Convert source gripper semantic (width / position) to the canonical
+        # continuous open_fraction target so multi-source posttrain MSE sees a
+        # unified gripper signal across all repos. NOTE: rewrites ctx.stats
+        # when enabled — downstream Normalize/Snap hydration must see the
+        # open_fraction-domain gripper stats.
+        schema = ctx.schema
+        src_sem = getattr(schema, "gripper_semantic", None)
+        grip_dims = tuple(getattr(schema, "gripper_action_dims", ()) or ())
+        grip_dim = int(grip_dims[0]) if grip_dims else 7
+        # Hardcoded calibration tables (extend here as new sources
+        # come in with calibrated endpoints):
+        #   width  → open_fraction with Franka spec [0, 0.04]
+        #   open_fraction → open_fraction is no-op (enabled=False)
+        _CALIBRATION = {
+            "width":         dict(closed=0.0, open=0.04, direction=+1),
+            "open_fraction": None,  # already canonical
+        }
+        cal = _CALIBRATION.get(src_sem)
+        # A declared-but-uncalibrated semantic ("position", "velocity",
+        # "binary") disables the transform. Surface it once so operators know
+        # the gripper stays in its source semantic (the cross-repo mix guard in
+        # scripts/utils/dataset_helpers.py is then the only protection).
+        if src_sem and src_sem not in _CALIBRATION:
+            from src.utils.logging_utils import warn_once
+            warn_once(
+                logging.getLogger(__name__),
+                ("gripper_semantic_no_calibration", src_sem, schema.schema_id),
+                "[hydrate_all] schema %s declares gripper_semantic=%r but "
+                "GripperSemanticCanonicalizeFn has no calibration entry for "
+                "it — the transform stays DISABLED and the gripper remains "
+                "in its source semantic. Add a _CALIBRATION entry if "
+                "canonicalization to open_fraction is intended.",
+                schema.schema_id, src_sem,
+            )
+        enabled = bool(src_sem and cal is not None and src_sem != "open_fraction")
+        if enabled:
+            t = replace(
+                self,
+                enabled=True,
+                source_semantic=src_sem,
+                target_semantic="open_fraction",
+                closed=float(cal["closed"]),
+                open=float(cal["open"]),
+                direction=int(cal["direction"]),
+                gripper_dim=grip_dim,
+                state_keys=tuple(schema.state_keys),
+                action_keys=tuple(schema.action_keys),
+            )
+            # Apply the same affine to gripper-dim stats so normalize
+            # downstream uses open_fraction-domain q01/q99/mean/std.
+            _calibration_for_stats = dict(
+                enabled=True,
+                source_semantic=src_sem,
+                target_semantic="open_fraction",
+                closed=float(cal["closed"]),
+                open=float(cal["open"]),
+                direction=int(cal["direction"]),
+                gripper_dim=grip_dim,
+            )
+            ctx.stats = _canonicalize_gripper_semantic_stats(
+                ctx.stats, schema, _calibration_for_stats
+            )
+        else:
+            t = replace(self, enabled=False, source_semantic=src_sem or "")
+        logging.info(
+            f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
+            f"source_semantic={t.source_semantic} target=open_fraction "
+            f"({schema.schema_id})"
+        )
+        return t
+
 
 def _canonicalize_gripper_semantic_stats(
     stats: dict | None, schema, calibration: dict | None
@@ -422,9 +540,9 @@ def _canonicalize_gripper_semantic_stats(
         def _has(arr) -> bool:
             return isinstance(arr, (list, tuple)) and len(arr) > grip_dim
 
-        # Location stats get the affine map. R2-D8: min/max are included —
-        # they were previously left in the SOURCE domain, breaking any
-        # min_max-mode consumer after canonicalization.
+        # Location stats get the affine map. min/max are included too, so a
+        # min_max-mode consumer is not left with source-domain bounds after
+        # canonicalization.
         for stat_name in ("q01", "q99", "mean", "min", "max"):
             arr = entry.get(stat_name)
             if not _has(arr):
@@ -438,12 +556,12 @@ def _canonicalize_gripper_semantic_stats(
             new = list(std)
             new[grip_dim] = float(new[grip_dim]) / abs(span)
             out["std"] = new
-        # R2-D8 fix: a DECREASING affine (direction=-1) swaps order statistics
-        # — the mapped q01 becomes the upper quantile and vice versa. Without
-        # the swap, stored q01 > q99 and downstream q01/q99 normalization
-        # inverts the gripper axis relative to direction=+1 sources, which is
-        # exactly the cross-source contradiction this canonicalizer exists to
-        # remove. Same for min/max.
+        # A DECREASING affine (direction=-1) swaps order statistics — the
+        # mapped q01 becomes the upper quantile and vice versa. Without the
+        # swap, stored q01 > q99 and downstream q01/q99 normalization inverts
+        # the gripper axis relative to direction=+1 sources, which is exactly
+        # the cross-source contradiction this canonicalizer exists to remove.
+        # Same for min/max.
         if direction < 0:
             for lo_name, hi_name in (("q01", "q99"), ("min", "max")):
                 lo, hi = out.get(lo_name), out.get(hi_name)
@@ -458,6 +576,10 @@ def _canonicalize_gripper_semantic_stats(
         e = stats.get(key)
         if isinstance(e, dict):
             canon[key] = _remap_entry(e)
+    # Persist the idempotency marker the entry guard checks — without it a
+    # second application would re-apply the affine rescale to already-canonical
+    # stats.
+    canon[_GRIPPER_CANON_MARKER] = True
     return canon
 
 
@@ -531,6 +653,41 @@ class CanonicalArmLayoutTransformFn(DataTransformFn):
         out[..., 13] = raw[..., right_grip]
         data[target_key] = out
 
+    def hydrate(self, ctx: "HydrateContext") -> "CanonicalArmLayoutTransformFn":
+        schema = ctx.schema
+        layout = getattr(schema, "arm_layout", None)
+        try:
+            from src.schema.arm_layout import ArmCount
+            is_dual_arm_layout = getattr(layout, "arm_count", None) == ArmCount.DUAL
+        except Exception:
+            is_dual_arm_layout = False
+        left_gripper_index = getattr(layout, "left_gripper_index_in_raw", None)
+        right_gripper_index = getattr(layout, "right_gripper_index_in_raw", None)
+        enabled = bool(
+            layout is not None
+            and is_dual_arm_layout
+            and getattr(schema, "source_state_keys", ())
+            and getattr(schema, "source_action_keys", ())
+            and left_gripper_index is not None
+            and right_gripper_index is not None
+        )
+        t = replace(
+            self,
+            enabled=enabled,
+            left_arm_dof=int(getattr(layout, "left_arm_dof", 0) or 0),
+            right_arm_dof=int(getattr(layout, "right_arm_dof", 0) or 0),
+            left_gripper_index_in_raw=int(left_gripper_index or -1),
+            right_gripper_index_in_raw=int(right_gripper_index or -1),
+            state_source_keys=tuple(getattr(schema, "source_state_keys", ()) or ()),
+            action_source_keys=tuple(getattr(schema, "source_action_keys", ()) or ()),
+        )
+        logging.info(
+            f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
+            f"state_sources={t.state_source_keys} action_sources={t.action_source_keys} "
+            f"({schema.schema_id})"
+        )
+        return t
+
 
 @DataTransformFn.register_subclass("canonical_single_arm_layout")
 @dataclass
@@ -540,7 +697,7 @@ class CanonicalSingleArmLayoutTransformFn(DataTransformFn):
     Counterpart to ``CanonicalArmLayoutTransformFn`` for single-arm datasets
     whose raw layout has either a sub-7-DoF arm (e.g. UR/festo 6-DoF) or
     trailing redundant multi-finger gripper joints that aggregate to one
-    scalar (e.g. festo/UR 11-dim, rizon4 12-dim where dims after
+    scalar (e.g. UR/festo 11-dim, rizon4 12-dim where dims after
     the gripper are perfectly correlated mirror copies of the single
     open-width signal).
 
@@ -612,6 +769,46 @@ class CanonicalSingleArmLayoutTransformFn(DataTransformFn):
         out[..., :arm_keep] = raw[..., :arm_keep]
         out[..., 7] = raw[..., grip]
         data[target_key] = out
+
+    def hydrate(self, ctx: "HydrateContext") -> "CanonicalSingleArmLayoutTransformFn":
+        schema = ctx.schema
+        layout = getattr(schema, "arm_layout", None)
+        try:
+            from src.schema.arm_layout import ArmCount
+            is_single_arm_layout = (
+                getattr(layout, "arm_count", None) == ArmCount.SINGLE
+            )
+        except Exception:
+            is_single_arm_layout = False
+        grip_idx = getattr(layout, "gripper_index_in_raw", None)
+        arm_dof = getattr(layout, "arm_dof", None)
+        enabled = bool(
+            layout is not None
+            and is_single_arm_layout
+            and getattr(schema, "source_state_keys", ())
+            and getattr(schema, "source_action_keys", ())
+            and grip_idx is not None
+            and arm_dof is not None
+        )
+        t = replace(
+            self,
+            enabled=enabled,
+            raw_arm_dof=int(arm_dof or 0),
+            raw_gripper_index_in_raw=int(grip_idx if grip_idx is not None else -1),
+            state_source_keys=tuple(
+                getattr(schema, "source_state_keys", ()) or ()
+            ),
+            action_source_keys=tuple(
+                getattr(schema, "source_action_keys", ()) or ()
+            ),
+        )
+        logging.info(
+            f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
+            f"raw_arm_dof={t.raw_arm_dof} raw_grip_idx={t.raw_gripper_index_in_raw} "
+            f"state_sources={t.state_source_keys} action_sources={t.action_source_keys} "
+            f"({schema.schema_id})"
+        )
+        return t
 
 
 @DataTransformFn.register_subclass("pad_state_and_action")
@@ -759,6 +956,75 @@ class SnapGripperToEndpointsFn(DataTransformFn):
         data[key] = v
         return True
 
+    def hydrate(self, ctx: "HydrateContext") -> "SnapGripperToEndpointsFn":
+        # Reads ctx.stats AFTER any GripperSemanticCanonicalizeFn rewrite
+        # earlier in the chain.
+        schema = ctx.schema
+        stats = ctx.stats
+        t = replace(
+            self,
+            state_keys=tuple(schema.state_keys),
+            action_keys=tuple(schema.action_keys),
+            state_dims=tuple(schema.state_dims),
+            action_dims=tuple(schema.action_dims),
+        )
+        logging.info(
+            f"Hydrated {t.__class__.__name__} gripper_dim={t.gripper_dim} "
+            f"({schema.schema_id})"
+        )
+        # snap_gripper_to_binary snaps raw gripper width to {0, max_width}
+        # BEFORE NormalizeTransformFn. For the intended exact {-1,+1}
+        # mapping, the gripper-dim stats MUST already be q01=0, q99=max_width.
+        # This is NOT done automatically — it requires running
+        # data_process/labutopia_canonicalize_stats.py on stats.json first.
+        # Verify and fail loud so a forgotten canonicalize step doesn't
+        # silently train a mis-scaled gripper. Bypass: LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1.
+        _grip = int(getattr(t, "gripper_dim", -1))
+        _maxw = float(getattr(t, "max_width", 0.0))
+        _ack = "action_abs" if ctx.action_mode == "abs" else "action"
+        _tol = max(1e-4, abs(_maxw) * 0.05)
+        _bad_snap = []
+        for _can in ("observation.state", _ack):
+            _b = stats.get(_can)
+            if not isinstance(_b, dict):
+                continue
+            _q01 = _b.get("q01")
+            _q99 = _b.get("q99")
+            # snap-to-binary REQUIRES q01/q99 (it maps {0,max_width}->{-1,+1}
+            # via q01/q99 normalization). If they are absent/short,
+            # NormalizeTransformFn falls back to mean_std (core.py
+            # _resolve_with_fallback) → the snapped values are mis-scaled and
+            # the guard must NOT silently pass. Treat absent/short/unparseable
+            # q01/q99 as a failure too.
+            if _q01 is None or _q99 is None:
+                _bad_snap.append((_can, "q01/q99 absent (snap needs quantile stats)"))
+                continue
+            try:
+                if 0 <= _grip < len(_q01) and 0 <= _grip < len(_q99):
+                    if abs(float(_q01[_grip])) > _tol or abs(float(_q99[_grip]) - _maxw) > _tol:
+                        _bad_snap.append((_can, float(_q01[_grip]), float(_q99[_grip])))
+                else:
+                    _bad_snap.append((_can, f"q01/q99 too short for gripper dim {_grip}"))
+            except (TypeError, ValueError, IndexError):
+                _bad_snap.append((_can, "q01/q99 unparseable"))
+        if _bad_snap:
+            _snap_msg = (
+                f"[hydrate_all] snap_gripper_to_binary=True but gripper-dim ({_grip}) "
+                f"stats are NOT canonicalized to q01=0 / q99={_maxw} (found "
+                f"(canonical, q01, q99) = {_bad_snap}). The snapped {{0, max_width}} "
+                f"values would be normalized through the dataset's raw q01/q99 instead "
+                f"of to exactly {{-1, +1}}, mis-scaling the gripper at train AND deploy. "
+                f"Run data_process/labutopia_canonicalize_stats.py on this dataset's "
+                f"stats.json before training."
+            )
+            if _env_flags.get("LABVLA_ALLOW_UNPATCHED_SNAP_STATS") == "1":
+                logging.error(_snap_msg + " [BYPASSED via LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1]")
+            else:
+                raise ValueError(
+                    _snap_msg + " Set LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1 to bypass intentionally."
+                )
+        return t
+
 
 @DataTransformFn.register_subclass("totensor")
 @dataclass
@@ -771,9 +1037,9 @@ class ToTensorTransformFn(DataTransformFn):
             # Tight image-key guard: a loose ``"image" in key`` substring
             # match would misfire on unrelated keys like
             # ``action_image_mask`` or ``task.image_target``. Match only explicit
-            # image slots: OBS_IMAGES prefix or the singleton OBS_IMAGE key. This
-            # matches the tighter guards already used by ResizeImagesWithPadFn
-            # (line 143) and ResizeShortestCenterCropFn (line 157).
+            # image slots: OBS_IMAGES prefix or the singleton OBS_IMAGE key,
+            # matching the tighter guards used by ResizeImagesWithPadFn and
+            # ResizeShortestCenterCropFn.
             if key.startswith(OBS_IMAGES) or key == OBS_IMAGE:
                 data[key] = self.img2tensor_fn(data[key])
             elif isinstance(data[key], list):
@@ -848,11 +1114,11 @@ class ComposeFieldsTransform(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         # Two-pass: first read + compute all merges, then write + pop. This
         # handles the case where the SAME src_key appears in multiple mappings.
-        # (R2-D15 note: no CURRENT registered schema overlaps state_keys with
-        # action_keys — oxe-auge uses observation.state vs observation.joints,
-        # and schema/validate.py now REJECTS such overlap outright because the
-        # Delta transform would overwrite the shared key with the delta chunk.
-        # The two-phase order is kept as cheap defense in depth.)
+        # No CURRENT registered schema overlaps state_keys with action_keys
+        # (oxe-auge uses observation.state vs observation.joints), and
+        # schema/validate.py REJECTS such overlap outright because the Delta
+        # transform would overwrite the shared key with the delta chunk. The
+        # two-phase order is kept as cheap defense in depth.
         merged_by_new_key: dict[str, torch.Tensor] = {}
         keys_to_pop: set[str] = set()
         for new_key, src_keys in self.mapping.items():
@@ -880,6 +1146,11 @@ class ComposeFieldsTransform(DataTransformFn):
             out.append(t)
         return out
 
+    def hydrate(self, ctx: "HydrateContext") -> "ComposeFieldsTransform":
+        t = replace(self, mapping=ctx.feature_map)
+        logging.info(f"Hydrated {t.__class__.__name__} ({ctx.schema.schema_id})")
+        return t
+
 
 @DataTransformFn.register_subclass("remap_image_key")
 @dataclass
@@ -891,10 +1162,9 @@ class RemapImageKeyTransformFn(DataTransformFn):
     the missing slots with zero-tensors AND `_mask=False` so normalization
     doesn't corrupt real data with artificial zero-centered padding signal.
 
-    CRIT-04 fix: previously `num_image_slots` was hardcoded to 3, silently
-    dropping the 4th+ camera when the schema declared more, and silently
-    fabricating dummy slots when it declared fewer. Now the slot count is
-    explicit and mismatches fail loud at hydrate_all time.
+    The slot count is explicit and mismatches fail loud at hydrate_all time,
+    rather than silently dropping cameras when the schema declares more or
+    fabricating dummy slots when it declares fewer.
 
     Example::
 
@@ -943,16 +1213,24 @@ class RemapImageKeyTransformFn(DataTransformFn):
                 data[f"{slot}_mask"] = torch.tensor(False, dtype=torch.bool)
         return data
 
+    def hydrate(self, ctx: "HydrateContext") -> "RemapImageKeyTransformFn":
+        schema = ctx.schema
+        t = replace(self, mapping=dict(schema.image_mapping))
+        logging.info(
+            f"Hydrated {t.__class__.__name__} with {len(schema.image_mapping)} "
+            f"cameras ({schema.schema_id})"
+        )
+        return t
+
 
 def _resolve_mode(key: str, default_mode: str, mode_overrides: dict[str, str]) -> str:
     """Pick normalization mode for a key. If any override-substring matches the key,
     that mode wins; otherwise returns default_mode.
 
-    L-03 fast-path: check for an exact key match first (O(1) dict lookup) — the
-    hot path is callers pre-computing mode_overrides keyed by full-key, and the
-    substring scan only exists for legacy "gripper"-style partial overrides.
-    Exact match wins over substring; among substrings, first match (insertion
-    order) wins.
+    Checks for an exact key match first (O(1) dict lookup) — the hot path is
+    callers pre-computing mode_overrides keyed by full-key, and the substring
+    scan only exists for legacy "gripper"-style partial overrides. Exact match
+    wins over substring; among substrings, first match (insertion order) wins.
     """
     # O(1) fast path: exact key match.
     exact = mode_overrides.get(key)
@@ -969,18 +1247,86 @@ def _stats_has_q01_q99(stats: dict) -> bool:
     return "q01" in stats and "q99" in stats
 
 
-# Plan-F: module-level _QUANTILE_FALLBACK_WARNED set removed in favor of
-# utils.logging_utils.DedupeFilter installed at process startup.
+# Deduplication is handled by utils.logging_utils.DedupeFilter installed at
+# process startup (no module-level warned-set needed here).
 def _warn_quantile_fallback_once(key: str, fallback: str, default_mode: str) -> None:
-    from utils.logging_utils import warn_once
+    from src.utils.logging_utils import warn_once
     warn_once(
         logging.getLogger(__name__),
         ("quantile_fallback", key, fallback),
         "[NormalizeTransformFn] Key %r mode=q01_q99 but stats lack q01/q99 — "
-        "falling back to %r. Run compute_stats.py to regenerate stats "
+        "falling back to %r. Run `python -m data_process stats` to regenerate stats "
         "with quantiles. (further occurrences for this key are suppressed)",
         key, fallback,
     )
+
+
+def expand_canonical_stats_per_key(
+    stats,
+    state_keys,
+    state_dims,
+    action_keys,
+    action_dims,
+    action_canonical_key,
+    schema_id="",
+):
+    """Slice canonical concatenated stats ('observation.state' and the chosen
+    action canonical key) into per-schema-key sub-dicts.
+
+    Shared by training-time ``NormalizeTransformFn.hydrate`` and deploy-time
+    ``serve_labvla`` so both build the SAME per-key view from the canonical
+    norm_stats (``data_process stats`` writes only the concatenated entries).
+    Returns a NEW dict: canonical entries preserved, per-schema-key entries added
+    by slicing each canonical array along the key's dim offset.
+    """
+    expanded = dict(stats)  # preserve the canonical entries for compat
+    for canonical, keys, dims in [
+        ("observation.state",    list(state_keys),  list(state_dims)),
+        (action_canonical_key,   list(action_keys), list(action_dims)),
+    ]:
+        base = stats.get(canonical)
+        if base is None or not isinstance(base, dict):
+            continue
+        total_expected = sum(dims)
+        offset = 0
+        for k, d in zip(keys, dims):
+            sub = {}
+            for sk, v in base.items():
+                # Slice array-like fields; copy metadata (count, …) as-is.
+                if sk == "count":
+                    sub[sk] = v
+                    continue
+                try:
+                    _len = len(v)
+                except TypeError:
+                    sub[sk] = v
+                    continue
+                if _len == 0:
+                    logging.warning(
+                        "[expand_canonical_stats_per_key] empty stats array: "
+                        "stats[%r][%r] is len=0; schema_id=%s, canonical=%r, "
+                        "per-schema-key=%r, expected_dim=%d, slice_offset=%d, "
+                        "total_expected=%d. Passing through as-is.",
+                        canonical, sk, schema_id, canonical, k, d, offset,
+                        total_expected,
+                    )
+                    sub[sk] = v
+                elif offset + d > _len:
+                    # Fail loud: normalizing a d-dim key against _len-dim stats
+                    # would be wrong numerics with NO error.
+                    raise ValueError(
+                        f"[expand_canonical_stats_per_key] stats[{canonical!r}]"
+                        f"[{sk!r}] has length {_len}, but schema {schema_id!r} "
+                        f"requires slice [{offset}:{offset + d}] for key {k!r}. "
+                        f"Expected total = sum({canonical}_dims) = {total_expected}. "
+                        f"Regenerate stats.json (`python -m data_process stats ...`) "
+                        f"or check that the schema matches this dataset's layout."
+                    )
+                else:
+                    sub[sk] = v[offset:offset + d]
+            expanded[k] = sub
+            offset += d
+    return expanded
 
 
 @DataTransformFn.register_subclass("normalize")
@@ -1009,14 +1355,14 @@ class NormalizeTransformFn(DataTransformFn):
     selected_keys: Optional[list[str]] = None
     mode: str = "mean_std"  # "mean_std" | "min_max" | "q01_q99"
     mode_overrides: dict[str, str] = field(default_factory=dict)
-    # Plan A+ (V6): per-dim mode override within a single key. Format:
+    # Per-dim mode override within a single key. Format:
     #   dim_overrides = {key: {dim_idx: mode}}
     # Example: {"action": {7: "q01_q99"}, "observation.state": {7: "q01_q99"}}
     # — for the 8-dim "action" / "observation.state" key, dims 0..6 use the
     # default `mode` (typically mean_std for arm joints, preserves natural
     # z-score range), dim 7 uses q01_q99 (gripper width — bimodal/binary
     # distribution, q01/q99 matches better than mean_std). Empty dict
-    # (default) preserves the legacy whole-key fast path bit-identically.
+    # (default) preserves the whole-key fast path bit-identically.
     # `hydrate_all` auto-injects these from `schema.gripper_action_dims` so
     # callers normally don't set this by hand.
     dim_overrides: dict[str, dict[int, str]] = field(default_factory=dict)
@@ -1048,6 +1394,18 @@ class NormalizeTransformFn(DataTransformFn):
                 )
             return "q01_q99"
         if mode == "q01_q99" and not _stats_has_q01_q99(stats):
+            if os.environ.get("LABVLA_ALLOW_Q0199_FALLBACK") != "1":
+                # For gripper dims the q01/q99 bounds ARE the cross-dataset
+                # open/close alignment contract (width 0.04 vs open_fraction
+                # 1.0); a silent mean_std fallback breaks it while training
+                # continues.
+                raise ValueError(
+                    f"[NormalizeTransformFn] Key '{key_label}' requests "
+                    "q01_q99 normalization but the stats lack q01/q99. "
+                    "Regenerate the stats file with quantiles, or set "
+                    "LABVLA_ALLOW_Q0199_FALLBACK=1 for the legacy "
+                    "warn-and-fall-back behavior."
+                )
             if "mean" in stats and "std" in stats:
                 fallback = "mean_std"
             elif "min" in stats and "max" in stats:
@@ -1193,6 +1551,172 @@ class NormalizeTransformFn(DataTransformFn):
                 out = out.squeeze(0)
             data[key] = out
         return data
+
+    def hydrate(self, ctx: "HydrateContext") -> "NormalizeTransformFn":
+        # Reads ctx.stats AFTER any GripperSemanticCanonicalizeFn rewrite.
+        schema = ctx.schema
+        stats = ctx.stats
+        selected_keys = ctx.selected_keys
+        action_mode = ctx.action_mode
+        # Structural guard: `stats is None` AND empty-dict both count
+        # as "stats missing". Without this second check a dataset whose
+        # meta/stats.json is missing would pass an empty dict, then
+        # NormalizeTransformFn would log a per-key warning and skip — i.e.
+        # silently train on un-normalized data.
+        if not stats:
+            raise FileNotFoundError(
+                "NormalizeTransformFn requires non-empty stats but got "
+                f"{stats!r}. Run: python -m data_process stats --dataset "
+                "<dataset_root> --schema <schema_name>"
+            )
+        # `data_process stats` emits canonical-concatenated entries keyed as
+        # `observation.state` and `action` — the state/action vectors AFTER
+        # ComposeFieldsTransform would concatenate schema.state_keys /
+        # action_keys. But NormalizeTransformFn runs BEFORE Compose in the
+        # chain, so it sees per-schema-key tensors and looks stats up by the
+        # schema's own key names. Build a per-schema-key view by slicing the
+        # canonical stats along each key's dim offset.
+        # action_mode chooses which canonical action stats to slice per-key.
+        action_canonical_key = ctx.action_canonical_key
+        if action_mode == "abs" and "action_abs" not in stats:
+            raise KeyError(
+                f"hydrate_all: action_mode='abs' requires stats['action_abs'] "
+                f"but it is missing in stats.json. Re-run `data_process stats` "
+                f"(the newer version writes both 'action' and 'action_abs'). "
+                f"stats keys present: {list(stats.keys())}"
+            )
+        # Per-schema-key slicing lives in the shared module function
+        # expand_canonical_stats_per_key so deploy (serve_labvla) builds the
+        # IDENTICAL per-key view from canonical norm_stats.
+        expanded = expand_canonical_stats_per_key(
+            stats,
+            schema.state_keys, schema.state_dims,
+            schema.action_keys, schema.action_dims,
+            action_canonical_key,
+            schema_id=schema.schema_id,
+        )
+
+        # Auto-build per-dim mode overrides.
+        #
+        # VLM-pretrain discretization exception:
+        #   π0.5 bins are uniform over q01/q99-normalized [-1, 1]. If dims
+        #   stay on mean_std, roughly 32% of near-Gaussian joint values fall
+        #   outside [-1, 1] and collapse into boundary bins. Therefore,
+        #   whenever DiscretizeStateTransformFn is present in the input
+        #   chain, every state AND action dim is forced to q01/q99 strictly.
+        #   Posttrain / π0-style knowledge-isolation runs do not include
+        #   DiscretizeStateTransformFn, so they keep the mixed policy below:
+        #   arm joints mean_std, gripper q01/q99.
+        #
+        # Action/gripper policy:
+        #   The canonical gripper dim (post-Compose, in the concatenated
+        #   action vector) is declared by schema.gripper_action_dims (and
+        #   arm_layout.gripper_indices_canonical which mirrors it). Map each
+        #   canonical gripper dim back to the *local* dim within whichever
+        #   schema-key contains it, then request q01_q99 on those local dims.
+        #   Default mode (mean_std, set at config-time) applies to remaining
+        #   action arm dims.
+        #
+        # Why this is the right shape for action data:
+        #   - arm joints span a wide near-Gaussian range → mean_std
+        #     preserves natural z-score precision; q01_q99 would
+        #     compress the working region by ~3× and erode spatial
+        #     accuracy.
+        #   - gripper width is bimodal (mostly fully open + brief
+        #     closure events) → q01_q99 [-1, 1] matches the bimodal
+        #     boundaries; mean_std gives huge mean-distance tails on
+        #     the closed mode.
+        #
+        # Concretely for LabUtopia single-arm Franka:
+        #   schema.state_keys = ('observation.state',), state_dims = (8,)
+        #   schema.action_keys = ('action',), action_dims = (8,)
+        #   schema.gripper_action_dims = (7,)
+        #   → dim_overrides = {
+        #       "observation.state": {7: "q01_q99"},
+        #       "action":            {7: "q01_q99"},
+        #     }
+        # For multi-key schemas (robointer_droid: separate
+        # joint/gripper keys), the gripper canonical dim falls inside
+        # the gripper-specific key at local dim 0, so the override
+        # fires on the whole 1-dim gripper key — semantically equivalent
+        # to a whole-key `mode_overrides={"gripper": "q99"}`.
+        gripper_canonical = tuple(getattr(schema, "gripper_action_dims", ()) or ())
+        dim_overrides: dict[str, dict[int, str]] = {}
+        has_state_discretize = ctx.has_state_discretize
+        # Per-segment normalization toggle. By default both arm joints and
+        # gripper are normalized. Setting one to False makes those dims pass
+        # through identity ("noop" mode), letting the model see raw values
+        # for that segment.
+        for canonical, keys, dims in [
+            ("observation.state",  list(schema.state_keys),  list(schema.state_dims)),
+            (action_canonical_key, list(schema.action_keys), list(schema.action_dims)),
+        ]:
+            base = stats.get(canonical)
+            if base is None or not isinstance(base, dict):
+                continue
+            offset = 0
+            for k, d in zip(keys, dims):
+                for local in range(d):
+                    global_dim = offset + local
+                    is_gripper = global_dim in gripper_canonical
+                    if has_state_discretize:
+                        mode = "q01_q99_strict"
+                        dim_overrides.setdefault(k, {})[local] = mode
+                    elif is_gripper:
+                        mode = ctx.gripper_norm_mode
+                        # only emit override when it differs from default ("mean_std")
+                        if mode != "mean_std":
+                            dim_overrides.setdefault(k, {})[local] = mode
+                    else:
+                        if not ctx.normalize_arm_joints:
+                            dim_overrides.setdefault(k, {})[local] = "noop"
+                        # else: keep default mean_std via fast-path (no override)
+                offset += d
+
+        # Fail LOUD at hydrate time when a normalized key
+        # has no stats, instead of NormalizeTransformFn silently warning +
+        # skipping at runtime. A missing canonical entry
+        # ('observation.state' / action_canonical_key) leaves the per-key
+        # slices absent from `expanded`, so those keys would be trained
+        # UN-normalized while other keys are normalized — a silent
+        # train-correctness break that is very hard to notice in a long run.
+        # Escape hatch for intentional edge configs (VQA-only / fully-noop
+        # ablations / partial stats): LABVLA_ALLOW_MISSING_NORM_STATS=1.
+        _missing_norm_keys = [
+            k for k in selected_keys if not isinstance(expanded.get(k), dict)
+        ]
+        if _missing_norm_keys:
+            _nm_msg = (
+                f"[hydrate_all] NormalizeTransformFn has NO stats for key(s) "
+                f"{_missing_norm_keys} (schema {schema.schema_id!r}). The canonical "
+                f"stats entry ('observation.state' / {action_canonical_key!r}) was "
+                f"absent or malformed, so these keys would be SILENTLY left "
+                f"un-normalized at runtime while other keys ARE normalized — a "
+                f"train-correctness break. Regenerate stats.json via "
+                f"`python -m data_process stats ...`. Present stats keys: "
+                f"{list(stats.keys())}."
+            )
+            if _env_flags.get("LABVLA_ALLOW_MISSING_NORM_STATS") == "1":
+                logging.error(_nm_msg + " [BYPASSED via LABVLA_ALLOW_MISSING_NORM_STATS=1]")
+            else:
+                raise ValueError(
+                    _nm_msg + " Set LABVLA_ALLOW_MISSING_NORM_STATS=1 to bypass intentionally."
+                )
+
+        t = replace(
+            self,
+            norm_stats=expanded,
+            selected_keys=selected_keys,
+            dim_overrides=dim_overrides,
+        )
+        logging.info(
+            f"Hydrated {t.__class__.__name__} with {len(selected_keys)} keys "
+            f"({schema.schema_id}); action_mode={action_mode}; sliced from "
+            f"[state='observation.state' ({'observation.state' in stats}), "
+            f"action={action_canonical_key!r} ({action_canonical_key in stats})]; "
+            f"dim_overrides={dim_overrides if dim_overrides else 'none'}"
+        )
+        return t
 
 
 @DataTransformFn.register_subclass("unnormalize")
@@ -1373,13 +1897,10 @@ class DeltaActionTransformFn(DataTransformFn):
         # adapter's delta_timestamps expansion can write a future window onto
         # a key that doubles as an action source), recover the t=0 state from
         # row 0 (delta_timestamps starts at 0.0).
-        # R2-D15 note: the old comment claimed oxe-auge has
-        # state_keys == action_keys == ("observation.joints",); that is FALSE
-        # (its state key is observation.state) and schema/validate.py now
-        # rejects state∩action overlap outright — after this transform the
-        # shared key would hold the DELTA chunk (row0 ≡ 0) and downstream
-        # Compose would feed a destroyed state to the model. The [0]-slice
-        # below stays as defense in depth only.
+        # schema/validate.py rejects state∩action overlap outright — were a key
+        # shared, after this transform it would hold the DELTA chunk (row0 ≡ 0)
+        # and downstream Compose would feed a destroyed state to the model. The
+        # [0]-slice below stays as defense in depth only.
         if state.ndim > 1:
             state = state[0]
         # Guard against true dimension bugs (3+ axes, 0-dim, etc.).
@@ -1435,14 +1956,42 @@ class DeltaActionTransformFn(DataTransformFn):
             size.append(t.shape[-1])
         return out, size
 
+    def hydrate(self, ctx: "HydrateContext") -> "DeltaActionTransformFn":
+        t = replace(self, mapping=ctx.feature_map, mask=ctx.bool_mask)
+        logging.info(
+            f"Hydrated {t.__class__.__name__} with mask ({ctx.schema.schema_id})"
+        )
+        return t
 
-# Phase 4: hydrate_normalize_transform / hydrate_compose_field_transform /
-# hydrate_delta_action_transform / hydrate_remap_image_key_transform /
-# filter_image_features were deleted. Every caller now uses hydrate_all(schema=...).
-# See doc/schema_manifest.md for migration guidance if you hit an import error.
+
+# ============== Unified hydrate interface using DatasetSchema ==============
 
 
-# ============== New unified hydrate interface using DatasetSchema ==============
+@dataclass
+class HydrateContext:
+    """Bag of schema-derived values a transform's ``hydrate`` may read.
+
+    Built once per chain by ``hydrate_all``. MUTABLE by design:
+    ``GripperSemanticCanonicalizeFn.hydrate`` rewrites ``stats`` (gripper-dim
+    affine into the open_fraction domain) and later hydrations
+    (``NormalizeTransformFn`` / ``SnapGripperToEndpointsFn``) must observe the
+    rewritten values.
+    """
+
+    schema: Any
+    stats: dict | None
+    action_mode: str            # "delta" | "abs"
+    gripper_norm_mode: str      # "q01_q99" | "mean_std" | "noop"
+    normalize_arm_joints: bool
+    has_state_discretize: bool  # DiscretizeStateTransformFn in the input chain
+    feature_map: dict           # {OBS_STATE: state_keys, ACTION: action_keys}
+    bool_mask: Any              # torch.BoolTensor from schema.to_bool_mask()
+    selected_keys: list
+
+    @property
+    def action_canonical_key(self) -> str:
+        return "action_abs" if self.action_mode == "abs" else "action"
+
 
 def hydrate_all(
     transforms: list[DataTransformFn],
@@ -1520,532 +2069,30 @@ def hydrate_all(
     # (those have empty source_*_keys).
     stats = _canonicalize_single_arm_stats(stats, schema)
 
-    # Lazy import to avoid a cycle: transform_labvla imports from transforms.core.
-    from policies.LabVLA.transform_labvla import UnifyLabVLAInputsTransformFn
-    # Annotation tokenize transform needs schema.annotation_losses injected.
-    from transforms.annotation_tokenize import AnnotationTokenizeTransformFn
-    # State-discretize (vlm_pretrain) needs schema.state_keys for split-state
-    # schemas where the transform runs BEFORE ComposeFieldsTransform.
-    from transforms.state_discretize import DiscretizeStateTransformFn
-    # AgiBot subtask builder: enabled iff schema.annotation_losses declares
-    # annotation.subtask. Otherwise stays no-op.
-    from transforms.agibot_subtask import BuildAgiBotSubtaskTransformFn
-    # FAST action tokenizer can tighten its source-local max_length once the
-    # dataset schema is known.
-    from transforms.fast_action import FastActionEncodeTransformFn
+    # DiscretizeStateTransformFn's presence forces q01_q99_strict on every
+    # state/action dim during Normalize hydration (π0.5 binning contract).
+    # Precomputed from the INPUT list, exactly like the old in-branch scan.
+    # Import stays lazy — state_discretize imports transforms.core at module
+    # top, so a top-level import here would be circular at module-init time.
+    from src.transforms.state_discretize import DiscretizeStateTransformFn
 
-    _has_subtask_loss = any(
-        getattr(spec, "field", None) == "annotation.subtask"
-        for spec in (schema.annotation_losses or ())
+    has_state_discretize = any(
+        isinstance(t, DiscretizeStateTransformFn) for t in transforms
     )
 
-    hydrated = []
-    for t in transforms:
-        if isinstance(t, CanonicalArmLayoutTransformFn):
-            layout = getattr(schema, "arm_layout", None)
-            try:
-                from schema.arm_layout import ArmCount
-                is_dual_arm_layout = getattr(layout, "arm_count", None) == ArmCount.DUAL
-            except Exception:
-                is_dual_arm_layout = False
-            left_gripper_index = getattr(layout, "left_gripper_index_in_raw", None)
-            right_gripper_index = getattr(layout, "right_gripper_index_in_raw", None)
-            enabled = bool(
-                layout is not None
-                and is_dual_arm_layout
-                and getattr(schema, "source_state_keys", ())
-                and getattr(schema, "source_action_keys", ())
-                and left_gripper_index is not None
-                and right_gripper_index is not None
-            )
-            t = replace(
-                t,
-                enabled=enabled,
-                left_arm_dof=int(getattr(layout, "left_arm_dof", 0) or 0),
-                right_arm_dof=int(getattr(layout, "right_arm_dof", 0) or 0),
-                left_gripper_index_in_raw=int(left_gripper_index or -1),
-                right_gripper_index_in_raw=int(right_gripper_index or -1),
-                state_source_keys=tuple(getattr(schema, "source_state_keys", ()) or ()),
-                action_source_keys=tuple(getattr(schema, "source_action_keys", ()) or ()),
-            )
-            logging.info(
-                f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
-                f"state_sources={t.state_source_keys} action_sources={t.action_source_keys} "
-                f"({schema.schema_id})"
-            )
-        elif isinstance(t, CanonicalSingleArmLayoutTransformFn):
-            layout = getattr(schema, "arm_layout", None)
-            try:
-                from schema.arm_layout import ArmCount
-                is_single_arm_layout = (
-                    getattr(layout, "arm_count", None) == ArmCount.SINGLE
-                )
-            except Exception:
-                is_single_arm_layout = False
-            grip_idx = getattr(layout, "gripper_index_in_raw", None)
-            arm_dof = getattr(layout, "arm_dof", None)
-            enabled = bool(
-                layout is not None
-                and is_single_arm_layout
-                and getattr(schema, "source_state_keys", ())
-                and getattr(schema, "source_action_keys", ())
-                and grip_idx is not None
-                and arm_dof is not None
-            )
-            t = replace(
-                t,
-                enabled=enabled,
-                raw_arm_dof=int(arm_dof or 0),
-                raw_gripper_index_in_raw=int(grip_idx if grip_idx is not None else -1),
-                state_source_keys=tuple(
-                    getattr(schema, "source_state_keys", ()) or ()
-                ),
-                action_source_keys=tuple(
-                    getattr(schema, "source_action_keys", ()) or ()
-                ),
-            )
-            logging.info(
-                f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
-                f"raw_arm_dof={t.raw_arm_dof} raw_grip_idx={t.raw_gripper_index_in_raw} "
-                f"state_sources={t.state_source_keys} action_sources={t.action_source_keys} "
-                f"({schema.schema_id})"
-            )
-        elif isinstance(t, GripperSemanticCanonicalizeFn):
-            # Convert source gripper semantic (width / position) to the
-            # canonical continuous open_fraction target so multi-source
-            # posttrain MSE sees a unified gripper signal across all repos.
-            src_sem = getattr(schema, "gripper_semantic", None)
-            grip_dims = tuple(getattr(schema, "gripper_action_dims", ()) or ())
-            grip_dim = int(grip_dims[0]) if grip_dims else 7
-            # Hardcoded calibration tables (extend here as new sources
-            # come in with calibrated endpoints):
-            #   width  → open_fraction with Franka spec [0, 0.04]
-            #   open_fraction → open_fraction is no-op (enabled=False)
-            _CALIBRATION = {
-                "width":         dict(closed=0.0, open=0.04, direction=+1),
-                "open_fraction": None,  # already canonical
-            }
-            cal = _CALIBRATION.get(src_sem)
-            # R2-D8 companion: a declared-but-uncalibrated semantic
-            # ("position", "velocity", "binary") used to disable the transform
-            # SILENTLY. Surface it once so operators know the gripper stays in
-            # its source semantic (the cross-repo mix guard in
-            # scripts/utils/dataset_helpers.py is then the only protection).
-            if src_sem and src_sem not in _CALIBRATION:
-                from utils.logging_utils import warn_once
-                warn_once(
-                    logging.getLogger(__name__),
-                    ("gripper_semantic_no_calibration", src_sem, schema.schema_id),
-                    "[hydrate_all] schema %s declares gripper_semantic=%r but "
-                    "GripperSemanticCanonicalizeFn has no calibration entry for "
-                    "it — the transform stays DISABLED and the gripper remains "
-                    "in its source semantic. Add a _CALIBRATION entry if "
-                    "canonicalization to open_fraction is intended.",
-                    schema.schema_id, src_sem,
-                )
-            enabled = bool(src_sem and cal is not None and src_sem != "open_fraction")
-            if enabled:
-                t = replace(
-                    t,
-                    enabled=True,
-                    source_semantic=src_sem,
-                    target_semantic="open_fraction",
-                    closed=float(cal["closed"]),
-                    open=float(cal["open"]),
-                    direction=int(cal["direction"]),
-                    gripper_dim=grip_dim,
-                    state_keys=tuple(schema.state_keys),
-                    action_keys=tuple(schema.action_keys),
-                )
-                # Apply the same affine to gripper-dim stats so normalize
-                # downstream uses open_fraction-domain q01/q99/mean/std.
-                _calibration_for_stats = dict(
-                    enabled=True,
-                    source_semantic=src_sem,
-                    target_semantic="open_fraction",
-                    closed=float(cal["closed"]),
-                    open=float(cal["open"]),
-                    direction=int(cal["direction"]),
-                    gripper_dim=grip_dim,
-                )
-                stats = _canonicalize_gripper_semantic_stats(
-                    stats, schema, _calibration_for_stats
-                )
-            else:
-                t = replace(t, enabled=False, source_semantic=src_sem or "")
-            logging.info(
-                f"Hydrated {t.__class__.__name__} enabled={t.enabled} "
-                f"source_semantic={t.source_semantic} target=open_fraction "
-                f"({schema.schema_id})"
-            )
-        elif isinstance(t, DeltaActionTransformFn):
-            t = replace(t, mapping=feature_map, mask=bool_mask)
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with mask ({schema.schema_id})"
-            )
-        elif isinstance(t, UnifyLabVLAInputsTransformFn):
-            # Supply action_keys so UnifyLabVLAInputsTransformFn can locate
-            # per-sub-key `_is_pad` tensors (OR-aggregation → action_is_pad).
-            t = replace(t, action_keys=tuple(schema.action_keys))
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with {len(t.action_keys)} "
-                f"action_keys ({schema.schema_id})"
-            )
-        elif isinstance(t, NormalizeTransformFn):
-            # Structural guard: `stats is None` AND empty-dict both count
-            # as "stats missing". Without this second check a dataset whose
-            # meta/stats.json is missing would pass an empty dict, then
-            # NormalizeTransformFn would log a per-key warning and skip — i.e.
-            # silently train on un-normalized data.
-            if not stats:
-                raise FileNotFoundError(
-                    "NormalizeTransformFn requires non-empty stats but got "
-                    f"{stats!r}. Run: python -m data_process stats --dataset "
-                    "<dataset_root> --schema <schema_name>"
-                )
-            # `data_process stats` emits canonical-concatenated entries keyed as
-            # `observation.state` and `action` — the state/action vectors AFTER
-            # ComposeFieldsTransform would concatenate schema.state_keys /
-            # action_keys. But NormalizeTransformFn runs BEFORE Compose in the
-            # chain, so it sees per-schema-key tensors and looks stats up by the
-            # schema's own key names. Build a per-schema-key view by slicing the
-            # canonical stats along each key's dim offset.
-            expanded = dict(stats)  # preserve the canonical entries for compat
-            # action_mode chooses which canonical action stats to slice per-key.
-            action_canonical_key = "action_abs" if action_mode == "abs" else "action"
-            if action_mode == "abs" and "action_abs" not in stats:
-                raise KeyError(
-                    f"hydrate_all: action_mode='abs' requires stats['action_abs'] "
-                    f"but it is missing in stats.json. Re-run `data_process stats` "
-                    f"(the newer version writes both 'action' and 'action_abs'). "
-                    f"stats keys present: {list(stats.keys())}"
-                )
-            for canonical, keys, dims in [
-                ("observation.state",    list(schema.state_keys),  list(schema.state_dims)),
-                (action_canonical_key,   list(schema.action_keys), list(schema.action_dims)),
-            ]:
-                base = stats.get(canonical)
-                if base is None or not isinstance(base, dict):
-                    continue
-                total_expected = sum(dims)
-                offset = 0
-                for k, d in zip(keys, dims):
-                    sub = {}
-                    for sk, v in base.items():
-                        # Slice array-like fields; copy metadata (count, …) as-is.
-                        # ``count`` may arrive as a 1-element list (legacy v8
-                        # stats_delta.json shape) or a scalar — both must
-                        # bypass the per-dim slice/length check.
-                        if sk == "count":
-                            sub[sk] = v
-                            continue
-                        try:
-                            _len = len(v)
-                        except TypeError:
-                            sub[sk] = v
-                            continue
-                        if _len == 0:
-                            # Empty stats array — treat as corrupted but keep
-                            # the original (caller may have intentionally
-                            # cleared the field). Warn once with enough
-                            # context (schema_id + key + canonical + the
-                            # NormalizeTransformFn offset) to debug without
-                            # re-opening the stats file by hand.
-                            logging.warning(
-                                "[hydrate_all] empty stats array: "
-                                "stats[%r][%r] is len=0; schema_id=%s, "
-                                "canonical=%r, per-schema-key=%r, "
-                                "expected_dim=%d, slice_offset=%d, "
-                                "total_expected=%d. Passing through as-is — "
-                                "NormalizeTransformFn will see an empty field "
-                                "and likely skip normalization for this key. "
-                                "Re-run `python -m data_process stats` to "
-                                "regenerate a full stats.json if this is "
-                                "unexpected.",
-                                canonical, sk, schema.schema_id,
-                                canonical, k, d, offset, total_expected,
-                            )
-                            sub[sk] = v
-                        elif offset + d > _len:
-                            # Do NOT silently return the whole (wrongly-sized)
-                            # array here: that would cause downstream
-                            # NormalizeTransformFn to normalize a `d`-dim key
-                            # against ``_len``-dim stats — wrong numerics with
-                            # NO error. Now fail loud.
-                            raise ValueError(
-                                f"[hydrate_all] stats[{canonical!r}][{sk!r}] has "
-                                f"length {_len}, but schema {schema.schema_id!r} "
-                                f"requires slice [{offset}:{offset + d}] for key "
-                                f"{k!r}. Expected total = sum({canonical}_dims) "
-                                f"= {total_expected}. Regenerate stats.json "
-                                f"(`python -m data_process stats ...`) or check "
-                                f"that the schema matches this dataset's layout."
-                            )
-                        else:
-                            sub[sk] = v[offset:offset + d]
-                    expanded[k] = sub
-                    offset += d
-
-            # Plan A+ (V6): auto-build per-dim mode overrides.
-            #
-            # VLM-pretrain discretization exception:
-            #   π0.5 bins are uniform over q01/q99-normalized [-1, 1]. If dims
-            #   stay on mean_std, roughly 32% of near-Gaussian joint values fall
-            #   outside [-1, 1] and collapse into boundary bins. Therefore,
-            #   whenever DiscretizeStateTransformFn is present in the input
-            #   chain, every state AND action dim is forced to q01/q99 strictly.
-            #   Posttrain / π0-style knowledge-isolation runs do not include
-            #   DiscretizeStateTransformFn, so they keep the mixed policy below:
-            #   arm joints mean_std, gripper q01/q99.
-            #
-            # Action/gripper policy:
-            #   The canonical gripper dim (post-Compose, in the concatenated
-            #   action vector) is declared by schema.gripper_action_dims (and
-            #   arm_layout.gripper_indices_canonical which mirrors it). Map each
-            #   canonical gripper dim back to the *local* dim within whichever
-            #   schema-key contains it, then request q01_q99 on those local dims.
-            #   Default mode (mean_std, set at config-time) applies to remaining
-            #   action arm dims.
-            #
-            # Why this is the right shape for action data:
-            #   - arm joints span a wide near-Gaussian range → mean_std
-            #     preserves natural z-score precision; q01_q99 would
-            #     compress the working region by ~3× and erode spatial
-            #     accuracy (this is the regression that hurt v11.x).
-            #   - gripper width is bimodal (mostly fully open + brief
-            #     closure events) → q01_q99 [-1, 1] matches the bimodal
-            #     boundaries; mean_std gives huge mean-distance tails on
-            #     the closed mode.
-            #
-            # Concretely for LabUtopia single-arm Franka:
-            #   schema.state_keys = ('observation.state',), state_dims = (8,)
-            #   schema.action_keys = ('action',), action_dims = (8,)
-            #   schema.gripper_action_dims = (7,)
-            #   → dim_overrides = {
-            #       "observation.state": {7: "q01_q99"},
-            #       "action":            {7: "q01_q99"},
-            #     }
-            # For multi-key schemas (robointer_droid: separate
-            # joint/gripper keys), the gripper canonical dim falls inside
-            # the gripper-specific key at local dim 0, so the override
-            # fires on the whole 1-dim gripper key — semantically equivalent
-            # to v8_ok's `mode_overrides={"gripper": "q99"}`.
-            gripper_canonical = tuple(getattr(schema, "gripper_action_dims", ()) or ())
-            dim_overrides: dict[str, dict[int, str]] = {}
-            has_state_discretize = any(
-                isinstance(candidate, DiscretizeStateTransformFn)
-                for candidate in transforms
-            )
-            # Per-segment normalization toggle. By default both arm joints and
-            # gripper are normalized. Setting one to False makes those dims pass
-            # through identity ("noop" mode), letting the model see raw values
-            # for that segment — matches V8 robointer_droid pretrain behavior
-            # where a stats-key naming bug accidentally skipped normalization.
-            for canonical, keys, dims in [
-                ("observation.state",  list(schema.state_keys),  list(schema.state_dims)),
-                (action_canonical_key, list(schema.action_keys), list(schema.action_dims)),
-            ]:
-                base = stats.get(canonical)
-                if base is None or not isinstance(base, dict):
-                    continue
-                offset = 0
-                for k, d in zip(keys, dims):
-                    for local in range(d):
-                        global_dim = offset + local
-                        is_gripper = global_dim in gripper_canonical
-                        if has_state_discretize:
-                            mode = "q01_q99_strict"
-                            dim_overrides.setdefault(k, {})[local] = mode
-                        elif is_gripper:
-                            mode = gripper_norm_mode
-                            # only emit override when it differs from default ("mean_std")
-                            if mode != "mean_std":
-                                dim_overrides.setdefault(k, {})[local] = mode
-                        else:
-                            if not normalize_arm_joints:
-                                dim_overrides.setdefault(k, {})[local] = "noop"
-                            # else: keep default mean_std via fast-path (no override)
-                    offset += d
-
-            # Fail LOUD at hydrate time when a normalized key
-            # has no stats, instead of NormalizeTransformFn silently warning +
-            # skipping at runtime. A missing canonical entry
-            # ('observation.state' / action_canonical_key) leaves the per-key
-            # slices absent from `expanded`, so those keys would be trained
-            # UN-normalized while other keys are normalized — a silent
-            # train-correctness break that is very hard to notice in a long run.
-            # Escape hatch for intentional edge configs (VQA-only / fully-noop
-            # ablations / partial stats): LABVLA_ALLOW_MISSING_NORM_STATS=1.
-            _missing_norm_keys = [
-                k for k in selected_keys if not isinstance(expanded.get(k), dict)
-            ]
-            if _missing_norm_keys:
-                _nm_msg = (
-                    f"[hydrate_all] NormalizeTransformFn has NO stats for key(s) "
-                    f"{_missing_norm_keys} (schema {schema.schema_id!r}). The canonical "
-                    f"stats entry ('observation.state' / {action_canonical_key!r}) was "
-                    f"absent or malformed, so these keys would be SILENTLY left "
-                    f"un-normalized at runtime while other keys ARE normalized — a "
-                    f"train-correctness break. Regenerate stats.json via "
-                    f"`python -m data_process stats ...`. Present stats keys: "
-                    f"{list(stats.keys())}."
-                )
-                if os.environ.get("LABVLA_ALLOW_MISSING_NORM_STATS") == "1":
-                    logging.error(_nm_msg + " [BYPASSED via LABVLA_ALLOW_MISSING_NORM_STATS=1]")
-                else:
-                    raise ValueError(
-                        _nm_msg + " Set LABVLA_ALLOW_MISSING_NORM_STATS=1 to bypass intentionally."
-                    )
-
-            t = replace(
-                t,
-                norm_stats=expanded,
-                selected_keys=selected_keys,
-                dim_overrides=dim_overrides,
-            )
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with {len(selected_keys)} keys "
-                f"({schema.schema_id}); action_mode={action_mode}; sliced from "
-                f"[state='observation.state' ({'observation.state' in stats}), "
-                f"action={action_canonical_key!r} ({action_canonical_key in stats})]; "
-                f"dim_overrides={dim_overrides if dim_overrides else 'none'}"
-            )
-        elif isinstance(t, ComposeFieldsTransform):
-            t = replace(t, mapping=feature_map)
-            logging.info(f"Hydrated {t.__class__.__name__} ({schema.schema_id})")
-        elif isinstance(t, SnapGripperToEndpointsFn):
-            t = replace(
-                t,
-                state_keys=tuple(schema.state_keys),
-                action_keys=tuple(schema.action_keys),
-                state_dims=tuple(schema.state_dims),
-                action_dims=tuple(schema.action_dims),
-            )
-            logging.info(
-                f"Hydrated {t.__class__.__name__} gripper_dim={t.gripper_dim} "
-                f"({schema.schema_id})"
-            )
-            # snap_gripper_to_binary snaps raw gripper width to {0, max_width}
-            # BEFORE NormalizeTransformFn. For the intended exact {-1,+1}
-            # mapping, the gripper-dim stats MUST already be q01=0, q99=max_width.
-            # This is NOT done automatically — it requires running
-            # data_process/labutopia_canonicalize_stats.py on stats.json first.
-            # Verify and fail loud so a forgotten canonicalize step doesn't
-            # silently train a mis-scaled gripper. Bypass: LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1.
-            _grip = int(getattr(t, "gripper_dim", -1))
-            _maxw = float(getattr(t, "max_width", 0.0))
-            _ack = "action_abs" if action_mode == "abs" else "action"
-            _tol = max(1e-4, abs(_maxw) * 0.05)
-            _bad_snap = []
-            for _can in ("observation.state", _ack):
-                _b = stats.get(_can)
-                if not isinstance(_b, dict):
-                    continue
-                _q01 = _b.get("q01")
-                _q99 = _b.get("q99")
-                # snap-to-binary REQUIRES q01/q99 (it maps {0,max_width}->{-1,+1}
-                # via q01/q99 normalization). If they are absent/short,
-                # NormalizeTransformFn falls back to mean_std (core.py
-                # _resolve_with_fallback) → the snapped values are mis-scaled and
-                # the guard must NOT silently pass. Treat absent/short/unparseable
-                # q01/q99 as a failure too.
-                if _q01 is None or _q99 is None:
-                    _bad_snap.append((_can, "q01/q99 absent (snap needs quantile stats)"))
-                    continue
-                try:
-                    if 0 <= _grip < len(_q01) and 0 <= _grip < len(_q99):
-                        if abs(float(_q01[_grip])) > _tol or abs(float(_q99[_grip]) - _maxw) > _tol:
-                            _bad_snap.append((_can, float(_q01[_grip]), float(_q99[_grip])))
-                    else:
-                        _bad_snap.append((_can, f"q01/q99 too short for gripper dim {_grip}"))
-                except (TypeError, ValueError, IndexError):
-                    _bad_snap.append((_can, "q01/q99 unparseable"))
-            if _bad_snap:
-                _snap_msg = (
-                    f"[hydrate_all] snap_gripper_to_binary=True but gripper-dim ({_grip}) "
-                    f"stats are NOT canonicalized to q01=0 / q99={_maxw} (found "
-                    f"(canonical, q01, q99) = {_bad_snap}). The snapped {{0, max_width}} "
-                    f"values would be normalized through the dataset's raw q01/q99 instead "
-                    f"of to exactly {{-1, +1}}, mis-scaling the gripper at train AND deploy. "
-                    f"Run data_process/labutopia_canonicalize_stats.py on this dataset's "
-                    f"stats.json before training."
-                )
-                if os.environ.get("LABVLA_ALLOW_UNPATCHED_SNAP_STATS") == "1":
-                    logging.error(_snap_msg + " [BYPASSED via LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1]")
-                else:
-                    raise ValueError(
-                        _snap_msg + " Set LABVLA_ALLOW_UNPATCHED_SNAP_STATS=1 to bypass intentionally."
-                    )
-        elif isinstance(t, RemapImageKeyTransformFn):
-            t = replace(t, mapping=dict(schema.image_mapping))
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with {len(schema.image_mapping)} "
-                f"cameras ({schema.schema_id})"
-            )
-        elif isinstance(t, AnnotationTokenizeTransformFn):
-            # Inject this dataset's annotation specs. Empty tuple → no-op path,
-            # zero tokenizer load, zero overhead for OXE-style datasets.
-            t = replace(t, annotation_specs=tuple(schema.annotation_losses))
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with "
-                f"{len(t.annotation_specs)} annotation_specs "
-                f"dynamic_shape={getattr(t, 'dynamic_shape', False)} "
-                f"({schema.schema_id})"
-            )
-        elif isinstance(t, FastActionEncodeTransformFn):
-            source_action_dim = int(sum(schema.action_dims or ()))
-            original_max_length = int(t.max_length)
-            effective_max_length = original_max_length
-            if getattr(t, "source_shape_convergence", False):
-                effective_max_length = source_fast_max_length(
-                    schema.schema_id,
-                    original_max_length,
-                )
-            if effective_max_length != original_max_length:
-                t = replace(t, max_length=effective_max_length)
-            logging.info(
-                f"Hydrated {t.__class__.__name__} max_length={t.max_length} "
-                f"source_action_dim={source_action_dim} "
-                f"trim_to_mask={getattr(t, 'trim_to_mask', False)} "
-                f"source_shape_convergence={getattr(t, 'source_shape_convergence', False)} "
-                f"({schema.schema_id})"
-            )
-        elif isinstance(t, BuildAgiBotSubtaskTransformFn):
-            # Gate on an EXPLICIT schema identity, not just the presence of an
-            # `annotation.subtask` loss field: gating on the field alone would
-            # fire for ANY schema reusing that field name, clobbering its `task`
-            # with the generic prompt and overwriting its `annotation.subtask`.
-            # The task→subtask backfill + prompt rewrite is AgiBot-specific (one
-            # task description per task dir), so require the AgiBot schema
-            # identity. robot_type / schema_id carry the family tag
-            # ("agibot_dual_arm" / "agibot_dual_arm_v1").
-            _robot_type = str(getattr(schema, "robot_type", "") or "")
-            _schema_id = str(getattr(schema, "schema_id", "") or "")
-            _is_agibot_schema = (
-                _robot_type.startswith("agibot") or _schema_id.startswith("agibot")
-            )
-            _agibot_enabled = bool(_has_subtask_loss and _is_agibot_schema)
-            t = replace(t, enabled=_agibot_enabled)
-            if _has_subtask_loss and not _is_agibot_schema:
-                logging.info(
-                    f"{t.__class__.__name__} left disabled: schema "
-                    f"{_schema_id!r} declares annotation.subtask but is not an "
-                    f"AgiBot schema — skipping task→subtask backfill/prompt rewrite."
-                )
-            if _agibot_enabled:
-                logging.info(
-                    f"Hydrated {t.__class__.__name__} enabled=True ({schema.schema_id})"
-                )
-        elif isinstance(t, DiscretizeStateTransformFn):
-            # Inject schema.state_keys so the transform can transiently
-            # concat per-key state tensors when OBS_STATE has not yet been
-            # built by ComposeFieldsTransform (split-state schemas like
-            # robointer_droid). For single-key schemas where state_keys
-            # already equals (OBS_STATE,) this is a no-op fall-through.
-            t = replace(t, state_keys=tuple(schema.state_keys))
-            logging.info(
-                f"Hydrated {t.__class__.__name__} with state_keys="
-                f"{tuple(schema.state_keys)} ({schema.schema_id})"
-            )
-        hydrated.append(t)
-    return hydrated
+    ctx = HydrateContext(
+        schema=schema,
+        stats=stats,
+        action_mode=action_mode,
+        gripper_norm_mode=gripper_norm_mode,
+        normalize_arm_joints=bool(normalize_arm_joints),
+        has_state_discretize=has_state_discretize,
+        feature_map=feature_map,
+        bool_mask=bool_mask,
+        selected_keys=selected_keys,
+    )
+    # Order-faithful single pass via per-class hydrate() methods; transforms
+    # with no schema needs inherit the base no-op. GripperSemanticCanonicalizeFn
+    # .hydrate may REWRITE ctx.stats (gripper-dim affine) for downstream
+    # Normalize/Snap hydration.
+    return [t.hydrate(ctx) for t in transforms]

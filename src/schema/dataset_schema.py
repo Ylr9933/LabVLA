@@ -6,13 +6,13 @@ deployment) consumes this object instead of dispatching on `robot_type`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 import torch
 
-from utils.constants import ACTION, OBS_STATE
+from src.utils.constants import ACTION, OBS_STATE
 
 from .annotation_loss import AnnotationLossSpec
 from .arm_layout import ArmLayoutSpec
@@ -101,9 +101,9 @@ class DatasetSchema:
     # (that is the whole point — supervise the VLM on high-level labels).
     annotation_losses: tuple[AnnotationLossSpec, ...] = ()
 
-    # M-A-4: Gripper physical semantics — what the gripper action channel
-    # actually represents in the source data. Used by the cross-dataset
-    # semantic guard in scripts/train.py:build_dataset to fail-loud when a
+    # Gripper physical semantics — what the gripper action channel actually
+    # represents in the source data. Used by the cross-dataset semantic guard
+    # in scripts/train.py:build_dataset to fail-loud when a
     # multi-repo training set mixes incompatible representations (e.g.
     # robointer's velocity command with LabUtopia's metric-width target).
     # q01/q99 normalization aligns scale but not semantics; mixing them
@@ -134,6 +134,21 @@ class DatasetSchema:
     source_state_dims: tuple[int, ...] = ()
     source_action_dims: tuple[int, ...] = ()
 
+    # Virtual state columns. Maps a schema state key with the mandatory
+    # "virtual." prefix (e.g. "virtual.joints_state") to the
+    # PHYSICAL parquet column whose same-frame value backs it (e.g.
+    # "observation.joints"). The adapter materializes the virtual key in
+    # __getitem__ by copying the source column's row — no on-disk column is
+    # read under the virtual name, and the stats readers resolve it to the
+    # physical column the same way. Use this when a dataset's nominal state
+    # column is unusable (oxe-auge_clean_v2: `observation.state` is the raw
+    # per-source vector with widths {2, 7, 15, 24} on ~94% of rows) but a
+    # reliable physical column holds the true canonical state. Keys must be
+    # state_keys members; action keys can never be virtual (the delta/chunk
+    # machinery reads disk columns). Frozen to MappingProxyType like
+    # image_mapping.
+    virtual_state_sources: Mapping[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         # Normalize mutable inputs into their canonical frozen forms BEFORE
         # validation — otherwise an un-normalized list of AnnotationLossSpec
@@ -145,6 +160,15 @@ class DatasetSchema:
         if not isinstance(self.annotation_losses, tuple):
             object.__setattr__(
                 self, "annotation_losses", tuple(self.annotation_losses)
+            )
+        if not isinstance(self.virtual_state_sources, MappingProxyType):
+            # Freeze even the EMPTY default — a mutable {} on a frozen
+            # dataclass lets callers rebind state sources in place,
+            # bypassing validate_schema entirely.
+            object.__setattr__(
+                self,
+                "virtual_state_sources",
+                _freeze_mapping(self.virtual_state_sources or {}),
             )
         # Structural validation lives in schema/validate.py (SSOT).
         from .validate import validate_schema
@@ -184,4 +208,6 @@ class DatasetSchema:
             out["source_action_keys"] = list(self.source_action_keys)
             out["source_state_dims"] = list(self.source_state_dims)
             out["source_action_dims"] = list(self.source_action_dims)
+        if self.virtual_state_sources:
+            out["virtual_state_sources"] = dict(self.virtual_state_sources)
         return out

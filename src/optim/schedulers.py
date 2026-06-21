@@ -23,9 +23,6 @@ import draccus
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from dataset.utils import write_json
-from utils.constants import SCHEDULER_STATE
-from utils.io_utils import deserialize_json_into_object
 
 
 @dataclass
@@ -94,7 +91,7 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     num_decay_steps: int
     decay_lr: float
     peak_lr: float | None = None  # unused — per-group base lr is authoritative
-    allow_auto_scale: bool = False  # C31 fix: fail-closed unless explicitly opted in
+    allow_auto_scale: bool = False  # fail-closed unless explicitly opted in
 
     def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
         actual_warmup_steps = self.num_warmup_steps
@@ -125,7 +122,7 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
             # escalate to a once-per-(config,run) WARNING.
             drift_frac = abs(num_training_steps - self.num_decay_steps) / self.num_decay_steps
             if drift_frac > 0.10:
-                from utils.logging_utils import warn_once
+                from src.utils.logging_utils import warn_once
                 warn_once(
                     logging.getLogger(__name__),
                     ("cosine_autoscale", num_training_steps, self.num_decay_steps),
@@ -177,12 +174,3 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambdas, -1)
 
 
-def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
-    state_dict = scheduler.state_dict()
-    write_json(state_dict, save_dir / SCHEDULER_STATE)
-
-
-def load_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> LRScheduler:
-    state_dict = deserialize_json_into_object(save_dir / SCHEDULER_STATE, scheduler.state_dict())
-    scheduler.load_state_dict(state_dict)
-    return scheduler

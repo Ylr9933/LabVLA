@@ -2,17 +2,14 @@
 
 All sequence-length related hyperparameters live here. Adapters / transforms /
 schemas / launch scripts MUST read from this dataclass — do NOT hardcode their
-own copies. Drift between scripts is the #1 source of silent regressions
-(e.g. `discrete_action_max_length=128` in launch script vs `=256` in
-scripts/train.py argparse default — the bug we hit on 2026-04-26).
+own copies. Drift between scripts is a common source of silent regressions
+(e.g. a discrete_action_max_length mismatch between a launch script and the
+train.py argparse default).
 
 Reference:
 - π0.5 paper §B.1 "Robot proprioceptive state is discretized and input to the
   model as text tokens" → state_num_bins=256.
-- OpenTau modeling_pi05.py:701 `((state + 1.0) * 128.0).long().clamp(0, 255)`
-  → matches our state_num_bins=256.
-- FAST tokenizer `physical-intelligence/fast` → vocab_size=2048 (verified via
-  AutoProcessor.from_pretrained).
+- FAST tokenizer `physical-intelligence/fast` → vocab_size=2048.
 """
 from __future__ import annotations
 
@@ -50,9 +47,10 @@ class RoboInterTokenBudget:
 
     # ---- Action / FAST (sourced from existing LabVLA defaults; do not change) ----
     chunk_size: int = 50
-    # Must match (or exceed) configuration_labvla.py runtime default, else this
-    # budget under-counts FAST token length. robointer p99=70, robocoin p99=124;
-    # legacy 128 silently truncated 3-5% of FAST CE targets.
+    # Must match (or exceed) the configuration_labvla.py runtime default, else
+    # this budget under-counts FAST token length. A smaller value silently
+    # truncates a few percent of FAST CE targets (robointer p99=70,
+    # robocoin p99=124).
     discrete_action_max_length: int = 240
     discrete_action_vocab_size: int = 2048  # FAST processor (physical-intelligence/fast)
     max_state_dim: int = 32

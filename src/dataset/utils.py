@@ -38,14 +38,9 @@ from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
 from torchvision import transforms
 
-from config.types import FeatureType, PolicyFeature
-from dataset.backward_compatibility import (
-    FUTURE_MESSAGE,
-    BackwardCompatibilityError,
-    ForwardCompatibilityError,
-)
-from utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
-from utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
+from src.config.types import FeatureType, PolicyFeature
+from src.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
+from src.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
@@ -147,57 +142,10 @@ def get_file_size_in_mb(file_path: Path) -> float:
     return file_size_bytes / (1024**2)
 
 
-def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
-    """Flatten a nested dictionary by joining keys with a separator.
-
-    Example:
-        >>> dct = {"a": {"b": 1, "c": {"d": 2}}, "e": 3}
-        >>> print(flatten_dict(dct))
-        {'a/b': 1, 'a/c/d': 2, 'e': 3}
-
-    Args:
-        d (dict): The dictionary to flatten.
-        parent_key (str): The base key to prepend to the keys in this level.
-        sep (str): The separator to use between keys.
-
-    Returns:
-        dict: A flattened dictionary.
-    """
-    items = []
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
-        else:
-            items.append((new_key, v))
-    return dict(items)
-
-
-def unflatten_dict(d: dict, sep: str = "/") -> dict:
-    """Unflatten a dictionary with delimited keys into a nested dictionary.
-
-    Example:
-        >>> flat_dct = {"a/b": 1, "a/c/d": 2, "e": 3}
-        >>> print(unflatten_dict(flat_dct))
-        {'a': {'b': 1, 'c': {'d': 2}}, 'e': 3}
-
-    Args:
-        d (dict): A dictionary with flattened keys.
-        sep (str): The separator used in the keys.
-
-    Returns:
-        dict: A nested dictionary.
-    """
-    outdict = {}
-    for key, value in d.items():
-        parts = key.split(sep)
-        d = outdict
-        for part in parts[:-1]:
-            if part not in d:
-                d[part] = {}
-            d = d[part]
-        d[parts[-1]] = value
-    return outdict
+# flatten_dict/unflatten_dict live in ``utils.dict_utils`` (generic dict helpers;
+# keeping them here forced the base ``utils`` package to import ``dataset``).
+# Re-exported so every existing importer keeps working.
+from src.utils.dict_utils import flatten_dict, unflatten_dict  # noqa: F401
 
 
 def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
@@ -443,40 +391,6 @@ def is_valid_version(version: str) -> bool:
         return False
 
 
-def check_version_compatibility(
-    repo_id: str,
-    version_to_check: str | packaging.version.Version,
-    current_version: str | packaging.version.Version,
-    enforce_breaking_major: bool = True,
-) -> None:
-    """Check for version compatibility between a dataset and the current codebase.
-
-    Args:
-        repo_id (str): The repository ID for logging purposes.
-        version_to_check (str | packaging.version.Version): The version of the dataset.
-        current_version (str | packaging.version.Version): The current version of the codebase.
-        enforce_breaking_major (bool): If True, raise an error on major version mismatch.
-
-    Raises:
-        BackwardCompatibilityError: If the dataset version is from a newer, incompatible
-            major version of the codebase.
-    """
-    v_check = (
-        packaging.version.parse(version_to_check)
-        if not isinstance(version_to_check, packaging.version.Version)
-        else version_to_check
-    )
-    v_current = (
-        packaging.version.parse(current_version)
-        if not isinstance(current_version, packaging.version.Version)
-        else current_version
-    )
-    if v_check.major < v_current.major and enforce_breaking_major:
-        raise BackwardCompatibilityError(repo_id, v_check)
-    elif v_check.minor < v_current.minor:
-        logging.warning(FUTURE_MESSAGE.format(repo_id=repo_id, version=v_check))
-
-
 def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:
     """Return available valid versions (branches and tags) on a given Hub repo.
 
@@ -495,6 +409,26 @@ def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:
             repo_versions.append(packaging.version.parse(ref))
 
     return repo_versions
+
+
+class CompatibilityError(Exception):
+    """Base for dataset codebase-version compatibility failures (M39)."""
+
+    def __init__(self, repo_id, version):
+        self.repo_id = repo_id
+        self.version = version
+        super().__init__(
+            f"{type(self).__name__}: repo {repo_id!r} only offers an "
+            f"incompatible codebase version {version} for this reader."
+        )
+
+
+class BackwardCompatibilityError(CompatibilityError):
+    """Repo only has an OLDER major codebase version than this code reads."""
+
+
+class ForwardCompatibilityError(CompatibilityError):
+    """Repo only has a NEWER major codebase version than this code reads."""
 
 
 def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> str:
@@ -941,55 +875,6 @@ def create_branch(repo_id: str, *, branch: str, repo_type: str | None = None) ->
     api.create_branch(repo_id, repo_type=repo_type, branch=branch)
 
 
-def create_lerobot_dataset_card(
-    tags: list | None = None,
-    dataset_info: dict | None = None,
-    **kwargs,
-) -> DatasetCard:
-    """Create a `DatasetCard` for a LeRobot dataset.
-
-    Keyword arguments are used to replace values in the card template.
-    Note: If specified, `license` must be a valid license identifier from
-    https://huggingface.co/docs/hub/repositories-licenses.
-
-    Args:
-        tags (list | None): A list of tags to add to the dataset card.
-        dataset_info (dict | None): The dataset's info dictionary, which will
-            be displayed on the card.
-        **kwargs: Additional keyword arguments to populate the card template.
-
-    Returns:
-        DatasetCard: The generated dataset card object.
-    """
-    card_tags = ["LeRobot"]
-
-    if tags:
-        card_tags += tags
-    if dataset_info:
-        dataset_structure = "[meta/info.json](meta/info.json):\n"
-        dataset_structure += f"```json\n{json.dumps(dataset_info, indent=4)}\n```\n"
-        kwargs = {**kwargs, "dataset_structure": dataset_structure}
-    card_data = DatasetCardData(
-        license=kwargs.get("license"),
-        tags=card_tags,
-        task_categories=["robotics"],
-        configs=[
-            {
-                "config_name": "default",
-                "data_files": "data/*/*.parquet",
-            }
-        ],
-    )
-
-    card_template = (importlib.resources.files("dataset") / "card_template.md").read_text()
-
-    return DatasetCard.from_template(
-        card_data=card_data,
-        template_str=card_template,
-        **kwargs,
-    )
-
-
 def validate_frame(frame: dict, features: dict) -> None:
     expected_features = set(features) - set(DEFAULT_FEATURES)
     actual_features = set(frame)
@@ -1264,7 +1149,7 @@ class Backtrackable(Generic[T]):
 
     __slots__ = ("_source", "_back_buf", "_ahead_buf", "_cursor", "_history", "_lookahead")
 
-    def __init__(self, iterable: Iterable[T], *, history: int = 1, lookahead: int = 0):
+    def __init__(self, iterable: Iterable[T], *, history: int = 1, lookahead: int = 1):
         if history < 1:
             raise ValueError("history must be >= 1")
         if lookahead <= 0:

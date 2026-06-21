@@ -1,7 +1,7 @@
 """Retry helpers for transient shared-storage I/O failures.
 
-The training cluster reads data and writes checkpoints through
-``/all-flash-data``. Short storage hiccups surface as ``EIO``/``ESTALE`` or
+The training cluster reads data and writes checkpoints through shared
+storage. Short storage hiccups surface as ``EIO``/``ESTALE`` or
 transport-related exceptions inside DataLoader workers. If those exceptions
 escape the worker, PyTorch tears down the worker and distributed training dies.
 

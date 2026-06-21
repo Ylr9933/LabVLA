@@ -29,7 +29,7 @@ import torch
 
 from .base import DatasetMeta
 from .lerobot_base import LeRobotAdapterBase, _get_shared_video_cache
-from utils.storage_retry import (
+from src.utils.storage_retry import (
     read_parquet_with_storage_retry,
     run_with_storage_retry,
     storage_path_exists,
@@ -49,124 +49,85 @@ def _read_episodes_jsonl(meta_root: Path) -> list[dict]:
     return out
 
 
-_SCAN_CACHE_FILE = ".labvla_scan_cache.json"
+# Scan-cache infrastructure lives in adapters/_scan_cache.py and _ep_starts_lens
+# in lerobot_base (shared indexing math); re-exported here for out-of-tree callers.
+from ._scan_cache import (  # noqa: F401
+    _SCAN_CACHE_FILE,
+    _load_scan_cache,
+    _save_scan_cache,
+    _scan_cache_key,
+    _shard_fingerprint,
+)
+from .lerobot_base import _ep_starts_lens  # noqa: F401
 
 # Episode index extracted from a v2.1 per-episode filename
 # ("episode_000123.parquet" → 123). Any digit width accepted.
 _EP_NUM_RE = re.compile(r"episode_(\d+)")
 
 
-def _shard_fingerprint(data_root: Optional[Path]) -> dict:
-    """Summarize the data/ shard parquet files by count + total size + max mtime.
+def _parquet_ok_v21(
+    p: Path,
+    *,
+    needed: list,
+    alt: dict,
+    declared_dim: dict,
+    ep_len_by_idx: dict,
+    repo_id: str,
+    warn_key_root: str,
+    allow_truncate: bool = False,
+) -> bool:
+    """Schema-satisfies check for a sample parquet.
 
-    A cheap content fingerprint so the scan cache invalidates on in-place shard
-    repair/replacement that keeps the episode list unchanged (keying only on
-    episodes.jsonl mtime missed those). O(num_shards) ``stat()`` calls, no
-    parquet open. Returns zeros when ``data_root`` is absent (degrades to the
-    previous episode-list-only behavior).
+    (a) every schema key must be present (or its v2.1 alt variant);
+    (b) any key with a per-episode list dim must not EXCEED the
+        schema's declared dim. Source-robot episodes whose native
+        state/action exceeds the declared envelope (e.g. a 49-dim
+        observation.state when schema says 30) are skipped rather
+        than truncated — truncation would lose actual joint info.
+        Shorter is OK; Phase-1 zero-pads up to declared dim.
+    (c) the parquet's row count must equal the episodes.jsonl `length`
+        for this episode — a longer meta length means an IndexError
+        mid-training; a shorter one means silently unsampled tail
+        frames. Either way the episode is dropped with a warning.
     """
-    if data_root is None:
-        return {"shard_count": 0, "shard_total_size": 0, "shard_max_mtime": 0.0}
-    count = 0
-    total_size = 0
-    max_mtime = 0.0
-    if data_root.is_dir():
-        for p in data_root.rglob("*.parquet"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            count += 1
-            total_size += int(st.st_size)
-            if st.st_mtime > max_mtime:
-                max_mtime = st.st_mtime
-    return {
-        "shard_count": count,
-        "shard_total_size": total_size,
-        "shard_max_mtime": max_mtime,
-    }
-
-
-def _scan_cache_key(
-    meta_root: Path,
-    schema_id: str,
-    chunks_size: int,
-    data_root: Optional[Path] = None,
-) -> dict:
-    """Fingerprint used to invalidate the cached scan.
-
-    Invalidated when any of these change from the stored key:
-      - schema_id: a different schema filters different episodes
-      - chunks_size: repartitioning changes chunk_ok semantics
-      - episodes_jsonl_mtime: the canonical "episode list changed" signal
-      - shard_*: count/total-size/max-mtime of data/**/*.parquet, so the cache
-        also invalidates when shard CONTENTS change even though the episode list
-        is identical (v3 has no episodes.jsonl and relies entirely on this).
-    """
-    ep_jsonl = meta_root / "episodes.jsonl"
-    return {
-        "schema_id": str(schema_id),
-        "chunks_size": int(chunks_size),
-        "episodes_jsonl_mtime": (
-            ep_jsonl.stat().st_mtime if ep_jsonl.exists() else 0.0
-        ),
-        **_shard_fingerprint(data_root),
-    }
-
-
-def _load_scan_cache(meta_root: Path, expected_key: dict) -> Optional[tuple[dict, set]]:
-    """Return (chunk_ok_map, existing_episodes) if cache is valid, else None.
-
-    Cache file is `meta/.labvla_scan_cache.json`; hidden to avoid cluttering.
-    Bypass by setting env `LABVLA_SCAN_CACHE=0`.
-    """
-    import os
-    if os.environ.get("LABVLA_SCAN_CACHE", "1") == "0":
-        return None
-    cache_path = meta_root / _SCAN_CACHE_FILE
-    if not cache_path.exists():
-        return None
+    import pyarrow.parquet as _pq
     try:
-        cached = json.loads(cache_path.read_text())
+        table = _pq.read_table(str(p))
     except Exception:
-        return None
-    if cached.get("key") != expected_key:
-        return None
-    # json keys are strings → restore int dict
-    chunk_ok = {int(k): bool(v) for k, v in cached.get("chunk_ok", {}).items()}
-    existing = set(int(x) for x in cached.get("existing_episodes", []))
-    return chunk_ok, existing
+        return False
+    _m = _EP_NUM_RE.search(p.name)
+    if _m is not None:
+        expected_len = ep_len_by_idx.get(int(_m.group(1)))
+        if expected_len is not None and expected_len != len(table):
+            from src.utils.logging_utils import warn_once
+            warn_once(
+                logger,
+                ("v21_row_len_mismatch", warn_key_root),
+                "[v21-adapter] %s: episode_%06d parquet has %d "
+                "rows but episodes.jsonl declares length=%d — "
+                "dropping episode (meta/data inconsistency; "
+                "further mismatches in this repo are dropped "
+                "with the same policy, warned once).",
+                repo_id, int(_m.group(1)),
+                len(table), expected_len,
+            )
+            return False
+    cols = set(table.schema.names)
+    for k in needed:
+        key_in_parquet = k if k in cols else alt.get(k)
+        if key_in_parquet is None or key_in_parquet not in cols:
+            return False
+        # Overflow check only for keys with a declared dim.
+        decl = declared_dim.get(k)
+        if decl is None or len(table) == 0:
+            continue
+        raw = table[key_in_parquet][0].as_py()
+        if isinstance(raw, (list, tuple)) and len(raw) > decl and not allow_truncate:
+            # v30 honors LABVLA_ALLOW_TRUNCATE here (keep the shard, truncate at
+            # read time); on v2.1 the over-wide episode is dropped instead.
+            return False
+    return True
 
-
-def _save_scan_cache(
-    meta_root: Path,
-    key: dict,
-    chunk_ok: dict[int, bool],
-    existing_episodes: set[int],
-) -> None:
-    """Atomically write scan result. Failure is non-fatal (just log)."""
-    cache_path = meta_root / _SCAN_CACHE_FILE
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    payload = {
-        "key": key,
-        "chunk_ok": {str(k): bool(v) for k, v in chunk_ok.items()},
-        "existing_episodes": sorted(int(x) for x in existing_episodes),
-    }
-    try:
-        tmp_path.write_text(json.dumps(payload))
-        import os
-        os.replace(tmp_path, cache_path)
-    except Exception as e:
-        logger.warning("[v21-adapter] failed to write scan cache at %s: %s", cache_path, e)
-
-
-def _ep_starts_lens(episodes: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-    """Parallel arrays: ep_starts[i] = global frame idx of ep i frame 0;
-    ep_lens[i] = length of ep i. Used for O(log N) global→(ep, local) lookup.
-    """
-    lens = np.array([int(e["length"]) for e in episodes], dtype=np.int64)
-    starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
-    return starts, lens
 
 
 class LeRobotV21Adapter(LeRobotAdapterBase):
@@ -189,7 +150,50 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
                 others are excluded. Used by the task-uniform sampler to build
                 per-task views of one repo — the adapter then reports
                 num_episodes/num_frames/sample() as if it held only those.
+
+        __init__ is a thin orchestrator over the four phase methods below.
         """
+        self._resolve_root(
+            repo_id, root, delta_timestamps, image_transforms, video_backend
+        )
+        stats, schema = self._load_meta_and_stats(external_stats, override_schema)
+
+        # Filter episodes whose parquet lacks schema-required state/action keys
+        # (e.g. robocoin chunks missing gripper_open_scale_* would crash
+        # downstream). Stats compute applies the same filter to stay aligned.
+        if schema is not None:
+            self._filter_episodes_by_schema(schema)
+
+        # Task-uniform support: restrict to a user-supplied episode subset,
+        # applied AFTER schema/parquet filters (view = filter ∩ schema-valid).
+        if episode_filter is not None:
+            allowed = {int(i) for i in episode_filter}
+            before = len(self._episodes)
+            self._episodes = [
+                ep for ep in self._episodes
+                if int(ep.get("episode_index", -1)) in allowed
+            ]
+            self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
+            logger.info(
+                "[v21-adapter] %s: episode_filter kept %d/%d episodes",
+                repo_id, len(self._episodes), before,
+            )
+
+        self._drop_terminal_samples_for_next_frame_actions(schema)
+
+        self._finalize_meta_and_caches(stats, schema)
+
+    # ---- __init__ phase methods --------------------------------------------
+
+    def _resolve_root(
+        self,
+        repo_id: str,
+        root: str | Path,
+        delta_timestamps: dict | None,
+        image_transforms,
+        video_backend: str,
+    ) -> None:
+        """Phase 1: root resolution, info.json version gate, episodes index."""
         self.repo_id = repo_id
         # Caller can pass either <parent>/<repo_id> or <root> directly.
         root_p = Path(root)
@@ -216,6 +220,11 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
         self._episodes = _read_episodes_jsonl(self.meta_root)
         self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
 
+    def _load_meta_and_stats(self, external_stats: dict | None, override_schema):
+        """Phase 2: tasks index, stats (+ external override), schema
+        discovery, next-frame stats patch. Returns ``(stats, schema)``."""
+        info = self._info
+
         # Load tasks.jsonl -> task_index (int) -> task (str). v2.1 parquet stores
         # integer `task_index` per frame; downstream transforms expect the string
         # `task` key (language instruction). Resolve on adapter load.
@@ -235,7 +244,7 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
         # Stats: absolute-value per-feature dict. external_stats overrides.
         stats_path = self.meta_root / "stats.json"
         if stats_path.exists():
-            from dataset.utils import cast_stats_to_numpy
+            from src.dataset.utils import cast_stats_to_numpy
             with open(stats_path) as _f:
                 stats: dict = cast_stats_to_numpy(json.load(_f))
         else:
@@ -244,7 +253,7 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
             stats = {**stats, **external_stats}
 
         # Schema discovery (Tier 0 override > Tier 1 manifest > Tier 2 infer).
-        from schema import discover_schema, SchemaDiscoveryError
+        from src.schema import discover_schema, SchemaDiscoveryError
         try:
             schema = discover_schema(
                 self.root,
@@ -252,253 +261,229 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
                 override=override_schema,
             )
         except SchemaDiscoveryError as e:
+            if override_schema is not None:
+                # The override came from --dataset_schema; discover_schema also
+                # VALIDATES it against the on-disk meta (camera mapping,
+                # annotation columns, ...). Swallowing the failure here would
+                # train on the unvalidated override with only a warning.
+                raise
             logger.warning("[v21-adapter] schema discovery failed: %s", e)
             schema = override_schema
 
         stats = self.patch_stats_for_next_frame_actions(stats, schema)
+        return stats, schema
 
-        # Filter episodes whose parquet lacks schema-required state/action keys
-        # (e.g. robocoin chunks missing gripper_open_scale_* would crash
-        # downstream). Stats compute applies the same filter to stay aligned.
-        if schema is not None:
-            import pyarrow.parquet as _pq
-            read_state_keys = (
-                tuple(getattr(schema, "source_state_keys", ()) or ())
-                or tuple(getattr(schema, "state_keys", ()) or ())
+    def _filter_episodes_by_schema(self, schema) -> None:
+        """Phase 3: drop episodes whose parquet lacks schema-required columns
+        or whose row count contradicts episodes.jsonl (scan-cached)."""
+        repo_id = self.repo_id
+        read_state_keys = (
+            tuple(getattr(schema, "source_state_keys", ()) or ())
+            or tuple(getattr(schema, "state_keys", ()) or ())
+        )
+        read_action_keys = (
+            tuple(getattr(schema, "source_action_keys", ()) or ())
+            or tuple(getattr(schema, "action_keys", ()) or ())
+        )
+        # _resolve_physical_column also maps virtual state keys to their
+        # physical source — a virtual key must never appear in `needed` or
+        # every episode would be dropped for "missing" it.
+        needed = list(dict.fromkeys(
+            self._resolve_physical_column(schema, k)
+            for k in (list(read_state_keys) + list(read_action_keys))
+        ))
+        # For canonical single-key schemas ("observation.state", "action")
+        # also accept the v2.1 legacy variants ("state", "actions").
+        alt = {"observation.state": "state", "action": "actions"}
+
+        # Per-key declared dim from schema (for the overflow check below).
+        # Also register SOURCE keys/dims: `needed` holds source column names
+        # when the schema declares them, so a canonical-only map would skip
+        # the overflow check for source-layout schemas.
+        declared_dim: dict[str, int] = {}
+        for k, d in zip(getattr(schema, "state_keys", ()),
+                        getattr(schema, "state_dims", ())):
+            declared_dim[k] = int(d)
+        for k, d in zip(getattr(schema, "action_keys", ()),
+                        getattr(schema, "action_dims", ())):
+            declared_dim[k] = int(d)
+        for k, d in zip(getattr(schema, "source_state_keys", ()) or (),
+                        getattr(schema, "source_state_dims", ()) or ()):
+            declared_dim[k] = int(d)
+        for k, d in zip(getattr(schema, "source_action_keys", ()) or (),
+                        getattr(schema, "source_action_dims", ()) or ()):
+            declared_dim[k] = int(d)
+        # `needed` holds the PHYSICAL source column for virtual state keys;
+        # attach the virtual key's declared dim to that physical name so the
+        # overflow check still probes it. setdefault: a column with its own
+        # schema-declared dim (e.g. it doubles as an action key) keeps that dim.
+        for vk, vsrc in (
+            getattr(schema, "virtual_state_sources", None) or {}
+        ).items():
+            if vk in declared_dim:
+                declared_dim.setdefault(str(vsrc), declared_dim[vk])
+
+        from src.utils import env_flags as _env_flags_t
+        _allow_truncate = _env_flags_t.get("LABVLA_ALLOW_TRUNCATE") == "1"
+
+        # Expected per-episode frame count from episodes.jsonl, cross-checked
+        # against the parquet's actual row count below.
+        _ep_len_by_idx: dict[int, int] = {
+            int(ep["episode_index"]): int(ep.get("length", -1))
+            for ep in self._episodes
+        }
+
+        def _parquet_ok(p: Path) -> bool:
+            # Shim binding the phase-local context to module-level _parquet_ok_v21.
+            return _parquet_ok_v21(
+                p,
+                needed=needed,
+                alt=alt,
+                declared_dim=declared_dim,
+                ep_len_by_idx=_ep_len_by_idx,
+                repo_id=repo_id,
+                warn_key_root=str(self.root),
+                allow_truncate=_allow_truncate,
             )
-            read_action_keys = (
-                tuple(getattr(schema, "source_action_keys", ()) or ())
-                or tuple(getattr(schema, "action_keys", ()) or ())
+
+        # Disk-persistent scan cache: for N-task adapters sharing a
+        # source_root, only the first pays the scan cost (~10s); the rest
+        # read the cached result (~10ms).
+        cache_key = _scan_cache_key(
+            self.meta_root,
+            schema_id=getattr(schema, "schema_id", "unknown"),
+            chunks_size=self._chunks_size,
+            data_root=self.data_root,
+        )
+        cache_key["required_columns"] = list(needed)
+        # Scan semantics include the per-episode row-count check, source-key
+        # overflow dims, declared dims and env gates; bump to invalidate caches
+        # written by an older scan version.
+        cache_key["integrity_checks"] = 3
+        cache_key["declared_dims"] = sorted(
+            (str(k), int(v)) for k, v in (declared_dim or {}).items()
+        )
+        cached = _load_scan_cache(self.meta_root, cache_key)
+
+        if cached is not None:
+            chunk_ok, existing_ep_indices = cached
+        else:
+            # Per-file validation is the safe DEFAULT. The alternative
+            # (LABVLA_V21_VALIDATE_PER_FILE=0) trusts one sampled parquet
+            # per chunk — fast on huge known-clean OXE datasets, but it can
+            # keep bad episodes from chunks whose sample happened to be fine.
+            from src.utils import env_flags as _env_flags
+            _validate_per_file = (
+                _env_flags.get("LABVLA_V21_VALIDATE_PER_FILE") != "0"
             )
-            needed = list(dict.fromkeys(
-                self._required_parquet_key(k)
-                for k in (list(read_state_keys) + list(read_action_keys))
-            ))
-            # For canonical single-key schemas ("observation.state", "action")
-            # also accept the v2.1 legacy variants ("state", "actions").
-            alt = {"observation.state": "state", "action": "actions"}
-
-            # Per-key declared dim from schema (for the overflow check below).
-            # R2-D7 companion fix: also register SOURCE keys/dims — `needed`
-            # holds source column names when the schema declares them, so the
-            # canonical-only map silently skipped the overflow check for
-            # source-layout schemas.
-            declared_dim: dict[str, int] = {}
-            for k, d in zip(getattr(schema, "state_keys", ()),
-                            getattr(schema, "state_dims", ())):
-                declared_dim[k] = int(d)
-            for k, d in zip(getattr(schema, "action_keys", ()),
-                            getattr(schema, "action_dims", ())):
-                declared_dim[k] = int(d)
-            for k, d in zip(getattr(schema, "source_state_keys", ()) or (),
-                            getattr(schema, "source_state_dims", ()) or ()):
-                declared_dim[k] = int(d)
-            for k, d in zip(getattr(schema, "source_action_keys", ()) or (),
-                            getattr(schema, "source_action_dims", ()) or ()):
-                declared_dim[k] = int(d)
-
-            # R2-D3/D21: expected per-episode frame count from episodes.jsonl,
-            # cross-checked against the parquet's actual row count below.
-            _ep_len_by_idx: dict[int, int] = {
-                int(ep["episode_index"]): int(ep.get("length", -1))
-                for ep in self._episodes
-            }
-
-            def _parquet_ok(p: Path) -> bool:
-                """Schema-satisfies check for a sample parquet.
-
-                (a) every schema key must be present (or its v2.1 alt variant);
-                (b) any key with a per-episode list dim must not EXCEED the
-                    schema's declared dim. Source-robot episodes whose native
-                    state/action exceeds the declared envelope (e.g. a 49-dim
-                    observation.state when schema says 30) are skipped rather
-                    than truncated — truncation would lose actual joint info.
-                    Shorter is OK; Phase-1 zero-pads up to declared dim.
-                (c) R2-D3/D21: the parquet's row count must equal the
-                    episodes.jsonl `length` for this episode — a longer meta
-                    length means an IndexError mid-training; a shorter one
-                    means silently unsampled tail frames. Either way the
-                    episode is dropped with a warning.
-                """
-                try:
-                    table = _pq.read_table(str(p))
-                except Exception:
-                    return False
-                _m = _EP_NUM_RE.search(p.name)
-                if _m is not None:
-                    expected_len = _ep_len_by_idx.get(int(_m.group(1)))
-                    if expected_len is not None and expected_len != len(table):
-                        from utils.logging_utils import warn_once
-                        warn_once(
-                            logger,
-                            ("v21_row_len_mismatch", str(self.root)),
-                            "[v21-adapter] %s: episode_%06d parquet has %d "
-                            "rows but episodes.jsonl declares length=%d — "
-                            "dropping episode (meta/data inconsistency; "
-                            "further mismatches in this repo are dropped "
-                            "with the same policy, warned once).",
-                            self.repo_id, int(_m.group(1)),
-                            len(table), expected_len,
-                        )
-                        return False
-                cols = set(table.schema.names)
-                for k in needed:
-                    key_in_parquet = k if k in cols else alt.get(k)
-                    if key_in_parquet is None or key_in_parquet not in cols:
-                        return False
-                    # Overflow check only for keys with a declared dim.
-                    decl = declared_dim.get(k)
-                    if decl is None or len(table) == 0:
-                        continue
-                    raw = table[key_in_parquet][0].as_py()
-                    if isinstance(raw, (list, tuple)) and len(raw) > decl:
-                        return False
-                return True
-
-            # Disk-persistent scan cache: for N-task adapters sharing a
-            # source_root, only the first pays the scan cost (~10s); the rest
-            # read the cached result (~10ms).
-            cache_key = _scan_cache_key(
-                self.meta_root,
-                schema_id=getattr(schema, "schema_id", "unknown"),
-                chunks_size=self._chunks_size,
-                data_root=self.data_root,
-            )
-            cache_key["required_columns"] = list(needed)
-            # R2-D3/D21/D7: scan semantics now include the per-episode row-count
-            # check + source-key overflow dims; invalidate caches from the old scan.
-            cache_key["integrity_checks"] = 2
-            cached = _load_scan_cache(self.meta_root, cache_key)
-
-            if cached is not None:
-                chunk_ok, existing_ep_indices = cached
-            else:
-                # Per-file validation is the safe DEFAULT. The alternative
-                # (LABVLA_V21_VALIDATE_PER_FILE=0) trusts one sampled parquet
-                # per chunk — fast on huge known-clean OXE datasets, but it can
-                # keep bad episodes from chunks whose sample happened to be fine.
-                _validate_per_file = (
-                    os.environ.get("LABVLA_V21_VALIDATE_PER_FILE", "1") != "0"
-                )
-                chunk_ok: dict[int, bool] = {}
-                file_ok: dict[Path, bool] = {}
-                for ep in self._episodes:
-                    chunk = int(ep.get("episode_index", 0)) // self._chunks_size
-                    if chunk in chunk_ok:
-                        continue
-                    chunk_dir = self.data_root / f"chunk-{chunk:03d}"
-                    if _validate_per_file:
-                        # Validate every parquet; chunk is OK if at least one
-                        # passes. Cache per-file results to drop individual bad
-                        # episodes below.
-                        any_ok = False
-                        if chunk_dir.is_dir():
-                            for child in chunk_dir.iterdir():
-                                if child.suffix != ".parquet":
-                                    continue
-                                ok = _parquet_ok(child)
-                                file_ok[child] = ok
-                                any_ok = any_ok or ok
-                        chunk_ok[chunk] = any_ok
-                    else:
-                        sample_path = None
-                        if chunk_dir.is_dir():
-                            for child in chunk_dir.iterdir():
-                                if child.suffix == ".parquet":
-                                    sample_path = child
-                                    break
-                        chunk_ok[chunk] = bool(sample_path and _parquet_ok(sample_path))
-
-                # Also filter per-episode by parquet existence ("cleaned"
-                # datasets sometimes keep the episodes.jsonl entry but delete
-                # the parquet) and, under per-file validation, by whether that
-                # specific parquet passed — otherwise file_ok would go unused
-                # and a bad file in an OK chunk would slip through.
-                import re as _re
-                _ep_re = _re.compile(r"episode_(\d+)")
-                existing_ep_indices: set[int] = set()
-                for _chunk, _ok in chunk_ok.items():
-                    if not _ok:
-                        continue
-                    _chunk_dir = self.data_root / f"chunk-{_chunk:03d}"
-                    if not _chunk_dir.is_dir():
-                        continue
-                    for _child in _chunk_dir.iterdir():
-                        if _child.suffix != ".parquet":
-                            continue
-                        if _validate_per_file and not file_ok.get(_child, False):
-                            continue
-                        _m = _ep_re.match(_child.stem)
-                        if _m:
-                            existing_ep_indices.add(int(_m.group(1)))
-
-                # Persist to disk for subsequent adapter inits on the same repo.
-                _save_scan_cache(
-                    self.meta_root, cache_key, chunk_ok, existing_ep_indices,
-                )
-
-            keep_eps: list[dict] = []
-            dropped = 0
+            chunk_ok: dict[int, bool] = {}
+            file_ok: dict[Path, bool] = {}
             for ep in self._episodes:
                 chunk = int(ep.get("episode_index", 0)) // self._chunks_size
-                if chunk_ok.get(chunk, False):
-                    keep_eps.append(ep)
+                if chunk in chunk_ok:
+                    continue
+                chunk_dir = self.data_root / f"chunk-{chunk:03d}"
+                if _validate_per_file:
+                    # Validate every parquet; chunk is OK if at least one
+                    # passes. Cache per-file results to drop individual bad
+                    # episodes below.
+                    any_ok = False
+                    if chunk_dir.is_dir():
+                        for child in chunk_dir.iterdir():
+                            if child.suffix != ".parquet":
+                                continue
+                            ok = _parquet_ok(child)
+                            file_ok[child] = ok
+                            any_ok = any_ok or ok
+                    chunk_ok[chunk] = any_ok
                 else:
-                    dropped += 1
+                    sample_path = None
+                    if chunk_dir.is_dir():
+                        for child in chunk_dir.iterdir():
+                            if child.suffix == ".parquet":
+                                sample_path = child
+                                break
+                    chunk_ok[chunk] = bool(sample_path and _parquet_ok(sample_path))
 
-            before_existence = len(keep_eps)
-            keep_eps = [
-                ep for ep in keep_eps
-                if int(ep.get("episode_index", -1)) in existing_ep_indices
-            ]
-            missing_parquets = before_existence - len(keep_eps)
-            if missing_parquets:
-                logger.warning(
-                    "[v21-adapter] %s: dropped %d additional episodes whose "
-                    "parquet file is missing on disk (e.g. 'episode_%06d.parquet' "
-                    "absent from data/chunk-*/)",
-                    repo_id,
-                    missing_parquets,
-                    next(
-                        (int(ep.get("episode_index", 0)) for ep in self._episodes
-                         if int(ep.get("episode_index", -1)) not in existing_ep_indices
-                         and int(ep.get("episode_index", 0)) // self._chunks_size in chunk_ok
-                         and chunk_ok[int(ep.get("episode_index", 0)) // self._chunks_size]),
-                        0,
-                    ),
-                )
-                dropped += missing_parquets
+            # Also filter per-episode by parquet existence ("cleaned"
+            # datasets sometimes keep the episodes.jsonl entry but delete
+            # the parquet) and, under per-file validation, by whether that
+            # specific parquet passed — otherwise file_ok would go unused
+            # and a bad file in an OK chunk would slip through.
+            import re as _re
+            _ep_re = _re.compile(r"episode_(\d+)")
+            existing_ep_indices: set[int] = set()
+            for _chunk, _ok in chunk_ok.items():
+                if not _ok:
+                    continue
+                _chunk_dir = self.data_root / f"chunk-{_chunk:03d}"
+                if not _chunk_dir.is_dir():
+                    continue
+                for _child in _chunk_dir.iterdir():
+                    if _child.suffix != ".parquet":
+                        continue
+                    if _validate_per_file and not file_ok.get(_child, False):
+                        continue
+                    _m = _ep_re.match(_child.stem)
+                    if _m:
+                        existing_ep_indices.add(int(_m.group(1)))
 
-            if dropped:
-                # Key on (repo_id, tuple(needed)) so a second repo with the
-                # same missing columns still emits once.
-                from utils.logging_utils import warn_once
-                warn_once(
-                    logger,
-                    ("repo_col_drop", repo_id, tuple(needed)),
-                    "[v21-adapter] %s: dropped %d/%d episodes lacking "
-                    "schema-required columns (%s)",
-                    repo_id, dropped, len(self._episodes), needed,
-                )
-                self._episodes = keep_eps
-                self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
-
-        # Task-uniform support: restrict to a user-supplied episode subset,
-        # applied AFTER schema/parquet filters (view = filter ∩ schema-valid).
-        if episode_filter is not None:
-            allowed = {int(i) for i in episode_filter}
-            before = len(self._episodes)
-            self._episodes = [
-                ep for ep in self._episodes
-                if int(ep.get("episode_index", -1)) in allowed
-            ]
-            self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
-            logger.info(
-                "[v21-adapter] %s: episode_filter kept %d/%d episodes",
-                repo_id, len(self._episodes), before,
+            # Persist to disk for subsequent adapter inits on the same repo.
+            _save_scan_cache(
+                self.meta_root, cache_key, chunk_ok, existing_ep_indices,
             )
 
-        self._drop_terminal_samples_for_next_frame_actions(schema)
+        keep_eps: list[dict] = []
+        dropped = 0
+        for ep in self._episodes:
+            chunk = int(ep.get("episode_index", 0)) // self._chunks_size
+            if chunk_ok.get(chunk, False):
+                keep_eps.append(ep)
+            else:
+                dropped += 1
+
+        before_existence = len(keep_eps)
+        keep_eps = [
+            ep for ep in keep_eps
+            if int(ep.get("episode_index", -1)) in existing_ep_indices
+        ]
+        missing_parquets = before_existence - len(keep_eps)
+        if missing_parquets:
+            logger.warning(
+                "[v21-adapter] %s: dropped %d additional episodes whose "
+                "parquet file is missing on disk (e.g. 'episode_%06d.parquet' "
+                "absent from data/chunk-*/)",
+                repo_id,
+                missing_parquets,
+                next(
+                    (int(ep.get("episode_index", 0)) for ep in self._episodes
+                     if int(ep.get("episode_index", -1)) not in existing_ep_indices
+                     and int(ep.get("episode_index", 0)) // self._chunks_size in chunk_ok
+                     and chunk_ok[int(ep.get("episode_index", 0)) // self._chunks_size]),
+                    0,
+                ),
+            )
+            dropped += missing_parquets
+
+        if dropped:
+            # Key on (repo_id, tuple(needed)) so a second repo with the
+            # same missing columns still emits once.
+            from src.utils.logging_utils import warn_once
+            warn_once(
+                logger,
+                ("repo_col_drop", repo_id, tuple(needed)),
+                "[v21-adapter] %s: dropped %d/%d episodes lacking "
+                "schema-required columns (%s)",
+                repo_id, dropped, len(self._episodes), needed,
+            )
+            self._episodes = keep_eps
+            self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
+
+    def _finalize_meta_and_caches(self, stats, schema) -> None:
+        """Phase 4: feature/camera key extraction, fps gate, DatasetMeta,
+        video/parquet caches, shared counters."""
+        info = self._info
+        repo_id = self.repo_id
 
         feats = info.get("features", {}) or {}
         video_keys = [
@@ -558,6 +543,7 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
 
         # Warn once per (repo, horizon) if the longest offset clips past most
         # of the shortest episode. Cheap; does not change clip behavior.
+        self._validate_delta_timestamps_frame_aligned()
         self._validate_delta_timestamps_vs_episode_lens()
 
         # Hook into the process-wide PyAV container LRU (shared with v30):
@@ -566,17 +552,16 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
         self._video_cache = _get_shared_video_cache()
         self._video_cache_owner_id = id(self)
 
-        # R2-D2: fork-shared zero-frame fallback counter (must exist before
-        # DataLoader workers fork so worker increments reach the main process).
+        # Fork-shared zero-frame fallback counter (must exist before DataLoader
+        # workers fork so worker increments reach the main process).
         self._init_zero_frame_shared()
 
-        # R2-D5 fix: per-INSTANCE parquet LRU. A class-level @lru_cache on the
-        # method keyed (self, ep_idx) made all adapters in a mixture share ONE
-        # 8-slot cache (near-zero hit rate at 60+ adapters) and retained strong
-        # `self` references in the class-level cache. Binding lru_cache to the
-        # instance gives each adapter its own 8-slot window, as the original
-        # comment always claimed. (fork-only DataLoader workers inherit the
-        # bound wrapper without pickling.)
+        # Per-INSTANCE parquet LRU. A class-level @lru_cache on the method keyed
+        # (self, ep_idx) would make all adapters in a mixture share ONE 8-slot
+        # cache (near-zero hit rate at 60+ adapters) and retain strong `self`
+        # references. Binding lru_cache to the instance gives each adapter its
+        # own 8-slot window. Fork-only DataLoader workers inherit the bound
+        # wrapper without pickling.
         self._cached_ep_parquet = lru_cache(maxsize=8)(self._load_ep_parquet_uncached)
 
     def _close_video_containers(self) -> None:
@@ -598,7 +583,7 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
 
     # ---- format-specific I/O hooks (overrides LeRobotAdapterBase) ----
 
-    # maxsize=8 (bound per-instance in __init__, R2-D5): each adapter holds an
+    # maxsize=8 (bound per-instance in __init__): each adapter holds an
     # independent cache, so larger values multiply parquet residency across
     # adapters×ranks×workers. 8 covers the typical consecutive-episode window.
     def _load_ep_parquet_uncached(self, ep_idx: int) -> pd.DataFrame:
@@ -652,10 +637,10 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
             else:
                 container, stream = cached
 
-            # R2-D6 fix: exact Fraction frame arithmetic (mirrors the v30
-            # adapter). The old float `round(pts*tb*fps)` mapping could skip
-            # the target frame on non-integer average_rate / VFR streams and
-            # silently fall back to a zero frame (reason=index_overshoot).
+            # Exact Fraction frame arithmetic (mirrors the v30 adapter). A float
+            # `round(pts*tb*fps)` mapping can skip the target frame on
+            # non-integer average_rate / VFR streams and silently fall back to a
+            # zero frame (reason=index_overshoot).
             fps_frac = Fraction(stream.average_rate) if stream.average_rate else Fraction(30)
             fps = float(fps_frac)
             tb = stream.time_base  # e.g. 1/15360 for 30 fps
@@ -678,7 +663,7 @@ class LeRobotV21Adapter(LeRobotAdapterBase):
             for f in container.decode(stream):
                 if f.pts is None:
                     continue
-                cur = round(f.pts * tb * fps_frac)  # exact Fraction math (R2-D6)
+                cur = round(f.pts * tb * fps_frac)  # exact Fraction math
                 if cur < frame:
                     continue  # still catching up from keyframe
                 if cur > frame:

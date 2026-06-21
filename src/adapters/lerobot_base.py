@@ -33,6 +33,17 @@ from .base import BaseAdapter
 logger = logging.getLogger(__name__)
 
 
+def _ep_starts_lens(episodes: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Parallel arrays: ep_starts[i] = global frame idx of ep i frame 0;
+    ep_lens[i] = length of ep i. Used for O(log N) global→(ep, local) lookup.
+
+    Shared indexing math used by both format adapters.
+    """
+    lens = np.array([int(e["length"]) for e in episodes], dtype=np.int64)
+    starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    return starts, lens
+
+
 def _is_missing_scalar_value(value) -> bool:
     """True if ``value`` is a pandas/NumPy missing scalar (NaN/NaT/None).
 
@@ -56,7 +67,9 @@ def _is_missing_scalar_value(value) -> bool:
 # v21 O(av.open per frame) bottleneck: consecutive frames in one chunk reuse a
 # single cached container. Each DataLoader worker fork gets its own empty cache.
 
-_VIDEO_CONTAINER_CACHE_MAX = int(os.environ.get("LABVLA_VIDEO_CACHE_MAX", "128"))
+from src.utils import env_flags as _env_flags  # registered LABVLA_* flags
+
+_VIDEO_CONTAINER_CACHE_MAX = int(_env_flags.get("LABVLA_VIDEO_CACHE_MAX"))
 
 
 class _SharedVideoContainerCache:
@@ -125,6 +138,9 @@ def _get_shared_video_cache() -> _SharedVideoContainerCache:
     if _SHARED_VIDEO_CACHE is None:
         _SHARED_VIDEO_CACHE = _SharedVideoContainerCache(_VIDEO_CONTAINER_CACHE_MAX)
     return _SHARED_VIDEO_CACHE
+
+
+_PAD_NARROW_WARNED: set = set()
 
 
 class LeRobotAdapterBase(BaseAdapter):
@@ -235,6 +251,29 @@ class LeRobotAdapterBase(BaseAdapter):
     def __len__(self) -> int:
         return int(self._ep_lens.sum())
 
+    def _validate_delta_timestamps_frame_aligned(self) -> None:
+        """Enforce that every delta-timestamp offset is an integer multiple of
+        1/fps (1e-4s tolerance). Arbitrary float offsets would be silently
+        snapped to the nearest frame at read time, changing the temporal
+        sampling semantics."""
+        dts = getattr(self, "delta_timestamps", None) or {}
+        fps = float(getattr(self.meta, "fps", 0) or 0)
+        if not dts or fps <= 0:
+            return
+        bad = []
+        for key, offsets in dts.items():
+            for dt in offsets:
+                frames = float(dt) * fps
+                if abs(frames - round(frames)) > 1e-4 * fps:
+                    bad.append((key, float(dt)))
+        if bad:
+            raise ValueError(
+                f"delta_timestamps contain non-frame-aligned offsets for "
+                f"fps={fps}: {bad[:6]} — each offset must be an integer "
+                f"multiple of 1/fps={1.0 / fps:.6f}s (M15: silent rounding "
+                f"changes the temporal sampling semantics)."
+            )
+
     def _validate_delta_timestamps_vs_episode_lens(self) -> None:
         """Warn once per repo if the longest ``delta_timestamps`` offset clips
         past the tail of many episodes.
@@ -268,7 +307,7 @@ class LeRobotAdapterBase(BaseAdapter):
             return
 
         if max_offset_frames > int(0.80 * min_ep_len):
-            from utils.logging_utils import warn_once
+            from src.utils.logging_utils import warn_once
 
             repo_id = getattr(self, "repo_id", "<unknown>")
             warn_once(
@@ -301,6 +340,36 @@ class LeRobotAdapterBase(BaseAdapter):
     def _required_parquet_key(cls, key: str) -> str:
         """Map a schema key to the physical parquet column it requires."""
         return cls._next_frame_action_source(key) or str(key)
+
+    # ---- virtual state column helpers --------------------------------------
+
+    @staticmethod
+    def _virtual_state_source(schema, key: str) -> Optional[str]:
+        """Physical source column for a schema-declared virtual state key.
+
+        Returns None when ``key`` is not virtual (or no schema). Virtual keys
+        carry the mandatory ``"virtual."`` prefix and are declared in
+        ``schema.virtual_state_sources`` — see DatasetSchema for the contract.
+        """
+        if schema is None:
+            return None
+        vss = getattr(schema, "virtual_state_sources", None) or {}
+        return vss.get(str(key))
+
+    @classmethod
+    def _resolve_physical_column(cls, schema, key: str) -> str:
+        """Schema key → the physical parquet column that backs it.
+
+        Resolution order: virtual-state mapping, then next-frame action
+        mapping (NEXT_FRAME_ACTION_SOURCES), else identity. Column
+        existence filters and read projections must use THIS (not
+        ``_required_parquet_key``) so shards are never dropped for "missing"
+        a column that only exists virtually.
+        """
+        return (
+            cls._virtual_state_source(schema, key)
+            or cls._required_parquet_key(key)
+        )
 
     @classmethod
     def _schema_uses_next_frame_actions(cls, schema) -> bool:
@@ -500,6 +569,52 @@ class LeRobotAdapterBase(BaseAdapter):
                 [not valid], dtype=torch.bool
             )
 
+    def _materialize_virtual_state(
+        self,
+        out: dict,
+        df: pd.DataFrame,
+        frame_in_ep: int,
+    ) -> None:
+        """Copy physical source columns into schema-declared virtual state keys.
+
+        A virtual state key ("virtual.<name>") never exists in parquet; the
+        schema's ``virtual_state_sources`` maps it to the physical column
+        whose SAME-FRAME value it mirrors, so no ``_is_pad`` companion is
+        needed (the source frame always exists). Padding to the declared
+        state dim mirrors the physical-column path in ``__getitem__``.
+
+        Fails loud when the source column is missing: episode/shard filtering
+        at init already required the resolved physical column, so a miss here
+        means meta/data drift — silently zero-filling would reintroduce the
+        garbage-state failure mode this mechanism exists to fix.
+        """
+        sch = self.meta.schema
+        vss = (
+            getattr(sch, "virtual_state_sources", None) or {}
+        ) if sch is not None else {}
+        if not vss:
+            return
+        for vkey, source_key in vss.items():
+            src_key = self._resolve_df_key(str(source_key), df)
+            if src_key is None:
+                raise KeyError(
+                    f"virtual state key {vkey!r}: physical source column "
+                    f"{source_key!r} not found in episode parquet (repo="
+                    f"{getattr(self, 'repo_id', '<unknown>')!r}). The schema "
+                    f"declares a virtual_state_sources binding this episode's "
+                    f"data does not satisfy — init-time column filtering and "
+                    f"the loaded data have drifted."
+                )
+            arr = np.atleast_1d(
+                np.asarray(df[src_key].iloc[frame_in_ep], dtype=np.float32)
+            )
+            target = self._schema_key_target_dim(str(vkey))
+            if target is not None:
+                arr = self._pad_row(arr, target)
+            if not arr.flags.writeable:
+                arr = np.array(arr, copy=True)
+            out[str(vkey)] = torch.as_tensor(arr)
+
     # ---- row-cell / per-key padding helpers (hoisted from v21) ------------
 
     @staticmethod
@@ -596,7 +711,7 @@ class LeRobotAdapterBase(BaseAdapter):
         if cur == target_dim:
             return arr
         if cur > target_dim:
-            if os.environ.get("LABVLA_ALLOW_TRUNCATE") == "1":
+            if _env_flags.get("LABVLA_ALLOW_TRUNCATE") == "1":
                 _repo = str(getattr(self, "repo_id", "<unknown>"))
                 self._emit_truncate_warning_once_cls(cur, target_dim, _repo)
                 return arr[..., :target_dim]
@@ -605,6 +720,16 @@ class LeRobotAdapterBase(BaseAdapter):
                 "refusing silent truncation. Either widen the schema's "
                 "state_dims/action_dims or set LABVLA_ALLOW_TRUNCATE=1 to "
                 "retain the legacy truncating behavior (not recommended)."
+            )
+        key = (str(getattr(self, "repo_id", "?")), int(cur), int(target_dim))
+        if key not in _PAD_NARROW_WARNED:
+            _PAD_NARROW_WARNED.add(key)
+            logger.warning(
+                "[adapter] %s: row width %d < declared dim %d — zero-padding. "
+                "A narrower-than-declared row usually means corrupt data or a "
+                "mis-declared schema dim; the padded zeros train as real "
+                "values. (warned once per (repo, width, dim))",
+                key[0], cur, target_dim,
             )
         pad_shape = list(arr.shape)
         pad_shape[-1] = target_dim - cur
@@ -629,7 +754,7 @@ class LeRobotAdapterBase(BaseAdapter):
         # (v3.0 uses prefixed feature names, v2.1 unprefixed like
         # ``camera_1_rgb``) so adapter writes and the downstream
         # RemapImageKeyTransformFn stay on the same canonical shape.
-        from schema.camera_mapping import expand_camera_source as _expand_src
+        from src.schema.camera_mapping import expand_camera_source as _expand_src
         _canonical_image_key = {col: _expand_src(col) for col in image_keys_set}
         for col in df.columns:
             # PNG-in-parquet (dtype=image) columns are decoded inline here;
@@ -639,10 +764,9 @@ class LeRobotAdapterBase(BaseAdapter):
             if col in image_keys_set:
                 val = df[col].iloc[frame_in_ep]
                 frame_t = self._decode_image_cell(val)
-                # R2-D1 fix: dtype=image cameras must receive the SAME seeded
-                # augmentation as the mp4 decode path (lerobot_v21/_v30
-                # _read_video_frame). Previously this branch skipped
-                # image_transforms entirely, so PNG/JPEG-in-parquet datasets
+                # dtype=image cameras must receive the SAME seeded augmentation
+                # as the mp4 decode path (_read_video_frame). Skipping
+                # image_transforms here would leave PNG/JPEG-in-parquet datasets
                 # (all LabUtopia Level3 finetune tasks,
                 # verified dtype="image" on disk) trained with ZERO augmentation
                 # while --image_augmentation=true claimed otherwise.
@@ -697,15 +821,43 @@ class LeRobotAdapterBase(BaseAdapter):
         # with a (K, D) horizon tensor when delta_timestamps are configured.
         self._materialize_next_frame_actions(out, df, frame_in_ep)
 
+        # Virtual state keys are same-frame copies of a physical column;
+        # materialize them right after the synthetic action keys so
+        # every downstream consumer (Delta/Normalize/Compose) sees them like
+        # any physical state column.
+        self._materialize_virtual_state(out, df, frame_in_ep)
+
         # Resolve the language instruction string for the VLM processor.
         # Priority: task -> task_index -> natural_language_instruction (some v3
         # OXE sub-repos ship only the last). Warn-loud once if still empty so
         # empty-instruction training surfaces instead of passing silently.
-        if "task" not in out:
+        _existing_task = out.get("task")
+        _blank_task = (
+            isinstance(_existing_task, str) and not _existing_task.strip()
+        )
+        if "task" not in out or _blank_task:
+            # An existing-but-blank task cell must not block the task_index /
+            # natural_language_instruction fallback, or the sample would train
+            # on an empty instruction even when a recoverable source exists on
+            # the same row.
             resolved_task = ""
-            if "task_index" in df.columns:
+            if "task_index" in df.columns and not getattr(
+                self, "_task_index_unreliable", False
+            ):
                 ti = int(df["task_index"].iloc[frame_in_ep])
                 resolved_task = self._tasks_by_idx.get(ti, "")
+            elif "task_index" in df.columns and not getattr(
+                self, "_warned_task_index_unreliable", False
+            ):
+                # info.json["task_index_remapped"]: per-frame indices point into
+                # per-SOURCE task tables, not the merged global one.
+                logging.getLogger(__name__).warning(
+                    "[H17] %s: skipping task_index fallback (merged product "
+                    "re-indexed tasks.parquet; falling through to "
+                    "natural_language_instruction). Warned once.",
+                    getattr(self, "repo_id", "?"),
+                )
+                self._warned_task_index_unreliable = True
             if not resolved_task and "natural_language_instruction" in df.columns:
                 nli = df["natural_language_instruction"].iloc[frame_in_ep]
                 if nli is not None and not _is_missing_scalar_value(nli):
@@ -718,7 +870,7 @@ class LeRobotAdapterBase(BaseAdapter):
         if _final_task is None or (
             isinstance(_final_task, str) and _final_task == ""
         ):
-            from utils.logging_utils import warn_once
+            from src.utils.logging_utils import warn_once
 
             repo_id = getattr(self, "repo_id", "<unknown>")
             warn_once(
@@ -774,9 +926,25 @@ class LeRobotAdapterBase(BaseAdapter):
             is_pad = np.array(
                 [i != c for i, c in zip(idxs, clipped)], dtype=bool
             )
-            col_vals = np.stack([
+            rows = [
                 np.atleast_1d(np.asarray(df[src_key].iloc[int(c)])) for c in clipped
-            ]).astype(np.float32)
+            ]
+            # Review L4: a column with per-row varying widths (e.g. the raw
+            # heterogeneous observation.state of a merged multi-source repo)
+            # would make np.stack raise an opaque broadcast error mid-training.
+            # Fail loud with an actionable message instead.
+            _widths = {int(r.shape[-1]) for r in rows}
+            if len(_widths) > 1:
+                raise ValueError(
+                    f"[adapter] {getattr(self, 'repo_id', '<unknown>')!r}: "
+                    f"column {src_key!r} has per-row varying widths "
+                    f"{sorted(_widths)} within one chunk window — cannot "
+                    f"stack into a (T, D) tensor. This column is not a usable "
+                    f"chunk source; bind the schema key to a homogeneous "
+                    f"physical column (or a virtual_state_sources copy of "
+                    f"one) instead."
+                )
+            col_vals = np.stack(rows).astype(np.float32)
             # Per-key schema target dim (multi-key schemas like robocoin pad
             # each column to its own declared dim before cat).
             target = self._schema_key_target_dim(key)
@@ -848,13 +1016,13 @@ class LeRobotAdapterBase(BaseAdapter):
 
     _last_read_was_zero_frame: bool = False
 
-    # R2-D2: fixed slot order for the fork-shared fallback counter. The local
-    # Counter below only ever accumulated inside DataLoader WORKER processes
-    # (fork copies), so the main process's save-time `video_fallback_summary`
-    # read an always-empty Counter whenever num_workers > 0 — the "silent I/O
-    # rot" diagnostic never fired. A multiprocessing.Array created in the main
-    # process BEFORE workers fork is shared memory: worker increments are
-    # visible to the main process.
+    # Fixed slot order for the fork-shared fallback counter. The local Counter
+    # below only ever accumulates inside DataLoader WORKER processes (fork
+    # copies), so with num_workers > 0 the main process's save-time
+    # `video_fallback_summary` would read an always-empty Counter and the
+    # "silent I/O rot" diagnostic would never fire. A multiprocessing.Array
+    # created in the main process BEFORE workers fork is shared memory, so
+    # worker increments are visible to the main process.
     _ZERO_FRAME_REASON_SLOTS: tuple[str, ...] = (
         "missing_file",
         "decode_error",
@@ -891,8 +1059,8 @@ class LeRobotAdapterBase(BaseAdapter):
             import collections as _collections
             self._zero_frame_reasons = _collections.Counter()
         self._zero_frame_reasons[reason] += 1
-        # R2-D2: also bump the fork-shared slot so the MAIN process's
-        # save-time summary sees worker-side fallbacks.
+        # Also bump the fork-shared slot so the MAIN process's save-time
+        # summary sees worker-side fallbacks.
         shared = getattr(self, "_zero_frame_shared", None)
         if shared is not None:
             slots = self._ZERO_FRAME_REASON_SLOTS
@@ -910,9 +1078,9 @@ class LeRobotAdapterBase(BaseAdapter):
         adapter's lifetime, so callers can log silent I/O rot ("why did MSE
         never drop on that repo").
 
-        R2-D2: prefer the fork-shared counter (includes DataLoader-worker
-        increments); fall back to the process-local Counter (num_workers=0 or
-        shared-memory init failure).
+        Prefer the fork-shared counter (includes DataLoader-worker increments);
+        fall back to the process-local Counter (num_workers=0 or shared-memory
+        init failure).
         """
         shared = getattr(self, "_zero_frame_shared", None)
         if shared is not None:

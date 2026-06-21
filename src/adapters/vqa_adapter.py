@@ -69,7 +69,7 @@ class _VQAAdapterMeta:
         schema-present invariant uniformly across LeRobot and VQA adapters.
         """
         if self.schema is None:
-            from schema.errors import SchemaDiscoveryError
+            from src.schema.errors import SchemaDiscoveryError
 
             raise SchemaDiscoveryError(
                 "_VQAAdapterMeta.schema is None after adapter construction. "
@@ -130,7 +130,7 @@ class VQAAdapter(BaseAdapter):
         if override_schema is not None:
             schema = override_schema
         else:
-            from schema.registry import resolve as _resolve_schema
+            from src.schema.registry import resolve as _resolve_schema
             schema_name = manifest.get("schema_name")
             if not schema_name:
                 raise ValueError(
@@ -142,7 +142,7 @@ class VQAAdapter(BaseAdapter):
                 )
             schema = _resolve_schema(schema_name)
 
-        from dataset.adapters.robointer_vqa_adapter import RoboInterVQADataset
+        from src.dataset.adapters.robointer_vqa_adapter import RoboInterVQADataset
 
         json_paths = [
             os.path.join(root, jp) for jp in manifest["json_files"]

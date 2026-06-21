@@ -4,8 +4,7 @@
 
 Why one unified field instead of 12 per-field CE heads?
 - π0.5 Eq (1) computes ONE CE over all output text tokens (paper App B.1-B.2).
-- OpenTau modeling_pi05.py:1333 sums response_ce + discrete_action_ce — also
-  one combined CE.
+- OpenTau sums response_ce + discrete_action_ce — also one combined CE.
 - 12 per-field CE = 12× lm_head matmul calls per step; one unified CE = 1 call.
 - Per-field weight tuning is a 12-D Cartesian space; per-sample sampling weight
   (PI0Mixture n^0.43) is the simpler control surface.
@@ -28,32 +27,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import Sequence
 
-from transforms.core import DataDict, DataTransformFn
+from src.transforms.core import DataDict, DataTransformFn
 
 
-# Default field order. annotation.segmentation is intentionally OMITTED —
-# dense pixel mask is too heavy to tokenize as text (would blow seq budget).
-#
-# bbox / object-location fields (object_box / gripper_box / affordance_box) are
-# emitted BEFORE annotation.substask. π0.5 App B.2 prescribes "locate first,
-# then subtask": grounding the boxes first constrains the subtask token
-# prediction (next-token CE sees boxes in the prefix when it predicts subtask).
-_DEFAULT_FIELDS: tuple[str, ...] = (
-    "annotation.object_box",
-    "annotation.gripper_box",
-    "annotation.affordance_box",
-    "annotation.substask",
-    "annotation.primitive_skill",
-    "annotation.instruction_add",
-    "annotation.placement_proposal",
-    "annotation.state_affordance",
-    "annotation.contact_frame",
-    "annotation.contact_points",
-    "annotation.trace",
-    # annotation.time_clip / annotation.origin_shape kept available but lower-
-    # signal — included for completeness, model will learn to skip if useless.
-    "annotation.time_clip",
-)
+# The field list (incl. ordering rationale — π0.5 "locate first, then subtask")
+# is schema-layer data shared with the v3.0 adapter's column projection; the
+# single source lives in schema/annotation_loss.py.
+from src.schema.annotation_loss import UNIFIED_ANNOTATION_FIELDS as _DEFAULT_FIELDS
 
 
 # Short tag per field (keeps token count low — full names like
@@ -132,5 +112,8 @@ class BuildUnifiedAnnotationTransformFn(DataTransformFn):
                 break
             segments.append(seg)
             budget -= (len(seg) + 1)  # +1 for newline separator
+        # An empty unified text is LEGAL here — this transform sits in the
+        # chain even for schemas that declare no annotation loss (e.g.
+        # LabUtopia).
         data[self.unified_key] = "\n".join(segments)
         return data

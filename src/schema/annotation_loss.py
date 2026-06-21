@@ -30,6 +30,34 @@ from typing import Any
 _SUPPORTED_LOSS_TYPES = ("ce_text",)
 
 
+# The raw per-field columns that BuildUnifiedAnnotationTransformFn packs into
+# the synthesized `annotation.unified` text. Both the transform (builder) and
+# the v3.0 adapter's column projection (which must fetch these physical columns
+# so the builder has inputs) consume it.
+#
+# Field order matters (it is the order the model sees): bbox/object-location
+# fields come BEFORE annotation.substask per π0.5 App B.2 "locate first, then
+# subtask". `annotation.segmentation` is intentionally OMITTED — a dense pixel
+# mask is too heavy to tokenize as text. NOTE: "substask" (double s) is the
+# dataset's REAL column spelling.
+UNIFIED_ANNOTATION_FIELDS: tuple[str, ...] = (
+    "annotation.object_box",
+    "annotation.gripper_box",
+    "annotation.affordance_box",
+    "annotation.substask",
+    "annotation.primitive_skill",
+    "annotation.instruction_add",
+    "annotation.placement_proposal",
+    "annotation.state_affordance",
+    "annotation.contact_frame",
+    "annotation.contact_points",
+    "annotation.trace",
+    # annotation.time_clip kept available but lower-signal — included for
+    # completeness, model will learn to skip if useless.
+    "annotation.time_clip",
+)
+
+
 @dataclass(frozen=True)
 class AnnotationLossSpec:
     """Frozen spec for a single annotation-driven auxiliary loss.
@@ -67,8 +95,8 @@ class AnnotationLossSpec:
                 f"AnnotationLossSpec.loss_type must be one of {_SUPPORTED_LOSS_TYPES}, "
                 f"got {self.loss_type!r}"
             )
-        # C36 fix: bool is a subclass of int, so ``isinstance(True, (int, float))``
-        # is True. Without the explicit bool guard a config typo like
+        # bool is a subclass of int, so ``isinstance(True, (int, float))`` is
+        # True. Without the explicit bool guard a config typo like
         # ``weight: true`` / ``max_length: false`` would be silently coerced to
         # 1.0 / 1 / 0 and change the loss semantics instead of being rejected.
         if (isinstance(self.weight, bool)
@@ -96,7 +124,7 @@ class AnnotationLossSpec:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "AnnotationLossSpec":
-        # C36 fix: validate the RAW types before float()/int() coercion. Otherwise
+        # Validate the RAW types before float()/int() coercion. Otherwise
         # ``"weight": true`` round-trips through float(True)==1.0 (and
         # ``"max_length": false`` through int(False)==0) and silently changes
         # semantics instead of raising. bool is a subclass of int, so it is

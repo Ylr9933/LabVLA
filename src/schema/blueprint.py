@@ -155,10 +155,14 @@ class SingleArmBlueprint:
     # "info.json has extra cameras" check). Blueprint authoring does NOT read
     # this flag — it only forwards the value into the built DatasetSchema.
     allow_extra_cameras: bool = False
-    # M-A-4: physical semantics of the gripper action channel — see
+    # Physical semantics of the gripper action channel — see
     # DatasetSchema.gripper_semantic. Forwarded into the built schema; default
-    # None preserves legacy authoring (no cross-dataset semantic guard).
+    # None means no cross-dataset semantic guard.
     gripper_semantic: Optional[str] = None
+    # Virtual state columns — see DatasetSchema.virtual_state_sources.
+    # Forwarded verbatim; validate_schema enforces the "virtual." prefix and
+    # membership rules on the built schema.
+    virtual_state_sources: Mapping[str, str] = field(default_factory=dict)
 
     def build(self) -> DatasetSchema:
         a = self.arm
@@ -214,6 +218,7 @@ class SingleArmBlueprint:
             arm_layout=arm_layout,
             annotation_losses=annotation_losses,
             gripper_semantic=self.gripper_semantic,
+            virtual_state_sources=self.virtual_state_sources,
         )
 
 

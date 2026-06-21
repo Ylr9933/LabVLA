@@ -7,7 +7,7 @@ that produces a frozen `DatasetSchema` object consumed by all downstream code.
 See doc/schema_manifest.md for the manifest format and when each tier kicks in.
 """
 
-from utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from src.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from .dataset_schema import DatasetSchema
 from .discovery import discover_schema

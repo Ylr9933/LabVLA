@@ -9,8 +9,8 @@ declaratively.
 
 Usage (in a schema module):
 
-    from schema.arm_layout import ArmLayoutSpec, ArmCount
-    from schema.merge_recipe import MergeRecipe, SourceArmLayout
+    from src.schema.arm_layout import ArmLayoutSpec, ArmCount
+    from src.schema.merge_recipe import MergeRecipe, SourceArmLayout
 
     MERGE_RECIPE = MergeRecipe(
         canonical=ArmLayoutSpec(ArmCount.SINGLE, arm_dof=7, gripper_index_in_raw=7),

@@ -40,15 +40,13 @@ dependencies = [
     "draccus",
 ]
 
-# NOTE: this project does NOT ship as a pip-installable package today; it's
-# consumed via `PYTHONPATH=src:.` (see launch scripts and CLAUDE.md). The
+# NOTE: this project does NOT ship as a pip-installable package today; all
+# imports are rooted at the repo root (`from src.X ...`; entry points
+# self-insert the repo root into sys.path — see CLAUDE.md). The
 # `[project]` block above only exists so distribution-introspection tools
 # (importlib.metadata, pip show, etc.) can read the metadata, and so future
-# packaging work has a starting point. Most subdirectories under src/ are
-# intentionally NOT Python packages (no __init__.py) and adding them just
-# to satisfy setuptools.packages.find would mask runtime layout issues — so
-# we explicitly suppress automatic package discovery rather than wire it
-# up to broken globs.
+# packaging work has a starting point. We explicitly suppress automatic
+# package discovery rather than wire it up to broken globs.
 [tool.setuptools]
 packages = []
 

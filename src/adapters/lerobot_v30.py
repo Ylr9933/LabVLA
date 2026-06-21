@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections import OrderedDict
 from fractions import Fraction
 from functools import lru_cache
@@ -37,9 +36,14 @@ import pyarrow.parquet as pq
 import torch
 
 from .base import DatasetMeta
-from .lerobot_base import LeRobotAdapterBase, _get_shared_video_cache
-from .lerobot_v21 import _ep_starts_lens
-from utils.storage_retry import (
+from .lerobot_base import (
+    LeRobotAdapterBase,
+    _ep_starts_lens,
+    _get_shared_video_cache,
+)
+# Task-text heuristics are unified in schema/task_text.
+from src.schema.task_text import normalize_tasks as _normalize_tasks_unified
+from src.utils.storage_retry import (
     read_parquet_with_storage_retry,
     run_with_storage_retry,
     storage_path_exists,
@@ -64,55 +68,6 @@ def _read_episodes_parquet_v3(meta_root: Path) -> list[dict]:
       videos/<cam>/chunk_index, videos/<cam>/file_index,
       videos/<cam>/from_timestamp, videos/<cam>/to_timestamp
     """
-    def _maybe_decode_ascii_byte_array(seq):
-        """Return decoded string if `seq` looks like a NUL-padded UTF-8 byte
-        array (TFDS-style fixed-length string encoding used by OXE
-        `language_table_*` sub-repos), else None.
-
-        Heuristic tightened to avoid accepting low-id tokenizer output as text:
-          (a) every element in [0, 127] (ASCII range);
-          (b) NUL padding (trailing zeros) present, OR the array is fully
-              printable;
-          (c) after stripping NULs, >= 90% printable ASCII / whitespace;
-          (d) result is at least 2 chars long.
-
-        Returns None on any failure — caller falls through to the tokenized-task
-        path (fail-loud unless LABVLA_ALLOW_TOKENIZED_TASK_COERCION is set).
-        """
-        if not seq:
-            return None
-        try:
-            ints = [int(x) for x in seq]
-        except (TypeError, ValueError):
-            return None
-        if any(not (0 <= b <= 127) for b in ints):
-            return None
-        # (b) require NUL-padding evidence (proves TFDS fixed-length encoding)
-        # OR a fully printable array (unambiguously a string).
-        n_trailing_zeros = 0
-        for b in reversed(ints):
-            if b == 0:
-                n_trailing_zeros += 1
-            else:
-                break
-        printable_or_ws = lambda c: (0x20 <= c <= 0x7E) or c in (0x09, 0x0A, 0x0D)
-        non_pad = ints[: len(ints) - n_trailing_zeros] if n_trailing_zeros > 0 else ints
-        if not non_pad:
-            return None
-        all_printable = all(printable_or_ws(c) for c in non_pad)
-        if n_trailing_zeros == 0 and not all_printable:
-            # No padding AND not fully printable: likely tokenizer output.
-            return None
-        # (c) >=90% printable within the unpadded prefix.
-        n_printable = sum(1 for c in non_pad if printable_or_ws(c))
-        if n_printable < 0.9 * len(non_pad):
-            return None
-        decoded = bytes(non_pad).decode("ascii", errors="replace").rstrip()
-        # (d) single-char results are too ambiguous (could be any low-id token).
-        if len(decoded) < 2:
-            return None
-        return decoded
-
     ep_root = meta_root / "episodes"
     if not ep_root.is_dir():
         raise FileNotFoundError(f"v3 meta/episodes dir missing at {ep_root}")
@@ -145,37 +100,27 @@ def _read_episodes_parquet_v3(meta_root: Path) -> list[dict]:
         # restores the legacy coercion for inspection only.
         #
         # Exception: OXE `language_table_*` stores strings as NUL-padded ASCII
-        # byte arrays (TFDS idiom), not tokenizer output. _maybe_decode_ascii_
-        # byte_array decodes those back to text BEFORE the raise.
-        if val is None:
-            return None
-        if isinstance(val, (list, np.ndarray)):
-            allow_coerce = os.environ.get(
-                "LABVLA_ALLOW_TOKENIZED_TASK_COERCION") == "1"
-            out = []
-            for item in val:
-                if isinstance(item, (list, np.ndarray)):
-                    item_list = list(item) if isinstance(item, np.ndarray) else item
-                    decoded = _maybe_decode_ascii_byte_array(item_list)
-                    if decoded is not None:
-                        out.append(decoded)
-                    elif allow_coerce:
-                        out.append(str(list(item_list)))
-                    else:
-                        raise ValueError(
-                            "v30 adapter: encountered a tokenized (list<int>) "
-                            "task element. Coercing it to str() would train the "
-                            "VLM on digit strings rather than language. Either "
-                            "decode the tokens back to text in the upstream "
-                            "dataset, exclude tokenized-task shards from "
-                            "training, or set "
-                            "LABVLA_ALLOW_TOKENIZED_TASK_COERCION=1 for a "
-                            "best-effort inspection-only run."
-                        )
-                else:
-                    out.append(str(item) if item is not None else "")
-            return out
-        return val
+        # byte arrays (TFDS idiom), not tokenizer output — the unified
+        # heuristic (schema/task_text) decodes those BEFORE the raise. The env
+        # flag is read per call; the shared code takes the policy as an
+        # explicit parameter.
+        from src.utils import env_flags as _env_flags
+        return _normalize_tasks_unified(
+            val,
+            allow_tokenized_coercion=(
+                _env_flags.get("LABVLA_ALLOW_TOKENIZED_TASK_COERCION") == "1"
+            ),
+            undecodable_msg=(
+                "v30 adapter: encountered a tokenized (list<int>) "
+                "task element. Coercing it to str() would train the "
+                "VLM on digit strings rather than language. Either "
+                "decode the tokens back to text in the upstream "
+                "dataset, exclude tokenized-task shards from "
+                "training, or set "
+                "LABVLA_ALLOW_TOKENIZED_TASK_COERCION=1 for a "
+                "best-effort inspection-only run."
+            ),
+        )
 
     # Warn loud when heterogeneous `tasks` column types are detected, naming the
     # shards with tokenized (list<list<int>>) tasks so the operator can
@@ -190,7 +135,7 @@ def _read_episodes_parquet_v3(meta_root: Path) -> list[dict]:
             if isinstance(first, (list, np.ndarray)):
                 tokenized_paths.append(p)
     if tokenized_paths:
-        from utils.logging_utils import warn_once
+        from src.utils.logging_utils import warn_once
         # Heads-up that _normalize_tasks will raise at first read unless
         # LABVLA_ALLOW_TOKENIZED_TASK_COERCION=1.
         warn_once(
@@ -263,6 +208,91 @@ def _read_tasks_parquet_v3(tasks_path: Path) -> dict[int, str]:
     return {}
 
 
+
+
+def _shard_ok_v30(
+    ci: int,
+    fi: int,
+    *,
+    data_root: Path,
+    needed: list,
+    alt: dict,
+    shard_span: dict,
+    declared_dim: dict,
+    check_overwide: bool,
+    repo_id: str,
+) -> bool:
+    """Schema-satisfies check for one v3 data shard.
+
+    Checks: required columns (with v2.1 alt fallback), row-span sufficiency,
+    and an overwide first-row probe.
+    """
+    p = data_root / f"chunk-{ci:03d}" / f"file-{fi:03d}.parquet"
+    if not p.exists():
+        return False
+    try:
+        pf = pq.ParquetFile(str(p))
+        cols = set(pf.schema_arrow.names)
+    except Exception:
+        return False
+    resolved: dict[str, str] = {}
+    for k in needed:
+        if k in cols:
+            resolved[k] = k
+            continue
+        a = alt.get(k, None)
+        if a in cols:
+            resolved[k] = a
+            continue
+        return False
+    # The shard must hold enough rows for every episode slice it
+    # serves; otherwise _load_ep_parquet's iloc would return short
+    # frames → IndexError mid-training.
+    span = shard_span.get((ci, fi))
+    if span is not None:
+        try:
+            n_rows = int(pf.metadata.num_rows)
+        except Exception:
+            return False
+        need_rows = span[1] - span[0]
+        if n_rows < need_rows:
+            logger.warning(
+                "[v30-adapter] %s: shard %s has %d rows but "
+                "meta/episodes requires %d (span [%d, %d)) — "
+                "dropping shard (meta/data inconsistency).",
+                repo_id, p.name, n_rows, need_rows, span[0], span[1],
+            )
+            return False
+    # Overwide-column probe on the first row.
+    if check_overwide and declared_dim:
+        try:
+            probe_cols = [
+                resolved[k] for k in declared_dim if k in resolved
+            ]
+            if probe_cols and pf.metadata.num_row_groups > 0:
+                head = pf.read_row_group(0, columns=probe_cols)
+                if len(head) > 0:
+                    for k in declared_dim:
+                        if k not in resolved:
+                            continue
+                        raw0 = head.column(resolved[k])[0].as_py()
+                        if (isinstance(raw0, (list, tuple))
+                                and len(raw0) > declared_dim[k]):
+                            logger.warning(
+                                "[v30-adapter] %s: shard %s column "
+                                "%r is %d-wide > declared %d — "
+                                "dropping shard (set "
+                                "LABVLA_ALLOW_TRUNCATE=1 to keep "
+                                "and truncate).",
+                                repo_id, p.name, resolved[k],
+                                len(raw0), declared_dim[k],
+                            )
+                            return False
+        except Exception:
+            return False
+    return True
+
+
 class LeRobotV30Adapter(LeRobotAdapterBase):
     """Adapter for LeRobot v3.0 shard-packed datasets.
 
@@ -286,7 +316,51 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
         video_backend: str = "pyav",
         episode_filter: list[int] | tuple[int, ...] | None = None,
     ):
-        """See LeRobotV21Adapter for episode_filter semantics."""
+        """See LeRobotV21Adapter for episode_filter semantics.
+
+        __init__ is a thin orchestrator over the four phase methods below.
+        """
+        self._resolve_root(
+            repo_id, root, delta_timestamps, image_transforms, video_backend
+        )
+        stats, schema = self._load_meta_and_stats(external_stats, override_schema)
+
+        # Filter episodes whose data shard lacks schema-required columns. In v3
+        # a shard shares one schema, so check each unique (chunk, file) once and
+        # drop episodes pointing at a failed shard.
+        if schema is not None:
+            self._filter_episodes_by_schema(schema)
+
+        # Task-uniform support: restrict to a user-supplied episode subset.
+        if episode_filter is not None:
+            allowed = {int(i) for i in episode_filter}
+            before = len(self._episodes)
+            self._episodes = [
+                ep for ep in self._episodes
+                if int(ep.get("episode_index", -1)) in allowed
+            ]
+            self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
+            logger.info(
+                "[v30-adapter] %s: episode_filter kept %d/%d episodes",
+                repo_id, len(self._episodes), before,
+            )
+
+        self._drop_terminal_samples_for_next_frame_actions(schema)
+
+        self._finalize_meta_and_caches(stats, schema)
+
+    # ---- __init__ phase methods --------------------------------------------
+
+    def _resolve_root(
+        self,
+        repo_id: str,
+        root: str | Path,
+        delta_timestamps: dict | None,
+        image_transforms,
+        video_backend: str,
+    ) -> None:
+        """Phase 1: root resolution, info.json version gate, episodes meta +
+        length invariant."""
         self.repo_id = repo_id
         root_p = Path(root)
         if root_p.name != Path(repo_id).name and (root_p / repo_id).exists():
@@ -308,10 +382,14 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
                 f"expected v3.x."
             )
         self._info = info
+        # Merged products re-index the global tasks.parquet; per-frame
+        # task_index values still carry per-source indices and MUST NOT resolve
+        # language through the merged table.
+        self._task_index_unreliable = bool(info.get("task_index_remapped", False))
         self._chunks_size = int(info.get("chunks_size", 1000))
         self._episodes = _read_episodes_parquet_v3(self.meta_root)
 
-        # R2-D3/D21 fix: enforce `length == dataset_to_index - dataset_from_index`
+        # Enforce `length == dataset_to_index - dataset_from_index`
         # for every episode. This is pure meta arithmetic (zero I/O) and is the
         # invariant the whole indexing path rests on: `_flat_to_ep` samples
         # frame_in_ep ∈ [0, length) while `_load_ep_parquet` slices [from, to).
@@ -343,13 +421,18 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
         self._unfiltered_episodes = list(self._episodes)
         self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
 
+    def _load_meta_and_stats(self, external_stats: dict | None, override_schema):
+        """Phase 2: tasks index, stats (+ external override), schema
+        discovery, next-frame stats patch. Returns ``(stats, schema)``."""
+        info = self._info
+
         # tasks.parquet → {int: str} (v21 uses tasks.jsonl; same lookup path).
         self._tasks_by_idx = _read_tasks_parquet_v3(self.meta_root / "tasks.parquet")
 
         # stats.json — same format across v2.1 and v3.
         stats_path = self.meta_root / "stats.json"
         if stats_path.exists():
-            from dataset.utils import cast_stats_to_numpy
+            from src.dataset.utils import cast_stats_to_numpy
             with open(stats_path) as _f:
                 stats: dict = cast_stats_to_numpy(json.load(_f))
         else:
@@ -358,7 +441,7 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
             stats = {**stats, **external_stats}
 
         # Schema discovery (same chain as v21).
-        from schema import discover_schema, SchemaDiscoveryError
+        from src.schema import discover_schema, SchemaDiscoveryError
         try:
             schema = discover_schema(
                 self.root,
@@ -366,204 +449,166 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
                 override=override_schema,
             )
         except SchemaDiscoveryError as e:
+            if override_schema is not None:
+                # The override came from --dataset_schema; discover_schema also
+                # VALIDATES it against the on-disk meta (camera mapping,
+                # annotation columns, ...). Swallowing the failure here would
+                # train on the unvalidated override with only a warning.
+                raise
             logger.warning("[v30-adapter] schema discovery failed: %s", e)
             schema = override_schema
 
         stats = self.patch_stats_for_next_frame_actions(stats, schema)
+        return stats, schema
 
-        # Filter episodes whose data shard lacks schema-required columns. In v3
-        # a shard shares one schema, so check each unique (chunk, file) once and
-        # drop episodes pointing at a failed shard.
-        if schema is not None:
-            read_state_keys = (
-                tuple(getattr(schema, "source_state_keys", ()) or ())
-                or tuple(getattr(schema, "state_keys", ()) or ())
-            )
-            read_action_keys = (
-                tuple(getattr(schema, "source_action_keys", ()) or ())
-                or tuple(getattr(schema, "action_keys", ()) or ())
-            )
-            needed = list(dict.fromkeys(
-                self._required_parquet_key(k)
-                for k in (list(read_state_keys) + list(read_action_keys))
-            ))
-            alt = {"observation.state": "state", "action": "actions"}
+    def _filter_episodes_by_schema(self, schema) -> None:
+        """Phase 3: drop episodes whose shard lacks schema-required columns,
+        rows, or width envelope (scan-cached; one check per unique shard)."""
+        repo_id = self.repo_id
+        read_state_keys = (
+            tuple(getattr(schema, "source_state_keys", ()) or ())
+            or tuple(getattr(schema, "state_keys", ()) or ())
+        )
+        read_action_keys = (
+            tuple(getattr(schema, "source_action_keys", ()) or ())
+            or tuple(getattr(schema, "action_keys", ()) or ())
+        )
+        # _resolve_physical_column also maps virtual state keys to their
+        # physical source — a virtual key must never appear in `needed` or
+        # every shard would be dropped for "missing" it.
+        needed = list(dict.fromkeys(
+            self._resolve_physical_column(schema, k)
+            for k in (list(read_state_keys) + list(read_action_keys))
+        ))
+        alt = {"observation.state": "state", "action": "actions"}
 
-            # R2-D21: per-shard expected row span (min from / max to over ALL
-            # episodes in the shard) so _shard_ok can verify the parquet really
-            # holds enough rows for every episode slice.
-            _shard_span: dict[tuple[int, int], tuple[int, int]] = {}
-            for _e in self._episodes:
-                _key = (int(_e["data/chunk_index"]), int(_e["data/file_index"]))
-                _a = int(_e["dataset_from_index"])
-                _b = int(_e["dataset_to_index"])
-                _cur = _shard_span.get(_key)
-                _shard_span[_key] = (
-                    (_a, _b) if _cur is None
-                    else (min(_cur[0], _a), max(_cur[1], _b))
-                )
-
-            # R2-D7: per-read-key declared dims (SOURCE space when declared,
-            # mirroring what the projection actually reads) for the overwide
-            # check — v21's _parquet_ok had this; v30 previously skipped it and
-            # crashed later in _pad_row mid-training instead of dropping the
-            # shard at init. Honors LABVLA_ALLOW_TRUNCATE like the adapters.
-            _rs_dims = (
-                tuple(getattr(schema, "source_state_dims", ()) or ())
-                or tuple(getattr(schema, "state_dims", ()) or ())
+        # Per-shard expected row span (min from / max to over ALL episodes in
+        # the shard) so _shard_ok can verify the parquet really holds enough
+        # rows for every episode slice.
+        _shard_span: dict[tuple[int, int], tuple[int, int]] = {}
+        for _e in self._episodes:
+            _key = (int(_e["data/chunk_index"]), int(_e["data/file_index"]))
+            _a = int(_e["dataset_from_index"])
+            _b = int(_e["dataset_to_index"])
+            _cur = _shard_span.get(_key)
+            _shard_span[_key] = (
+                (_a, _b) if _cur is None
+                else (min(_cur[0], _a), max(_cur[1], _b))
             )
-            _ra_dims = (
-                tuple(getattr(schema, "source_action_dims", ()) or ())
-                or tuple(getattr(schema, "action_dims", ()) or ())
-            )
-            _declared_dim: dict[str, int] = {}
-            for _k, _d in zip(read_state_keys, _rs_dims):
-                _declared_dim[_k] = int(_d)
-            for _k, _d in zip(read_action_keys, _ra_dims):
-                _declared_dim[_k] = int(_d)
-            _check_overwide = os.environ.get("LABVLA_ALLOW_TRUNCATE") != "1"
 
-            def _shard_ok(ci: int, fi: int) -> bool:
-                p = self.data_root / f"chunk-{ci:03d}" / f"file-{fi:03d}.parquet"
-                if not p.exists():
-                    return False
-                try:
-                    pf = pq.ParquetFile(str(p))
-                    cols = set(pf.schema_arrow.names)
-                except Exception:
-                    return False
-                resolved: dict[str, str] = {}
-                for k in needed:
-                    if k in cols:
-                        resolved[k] = k
-                        continue
-                    a = alt.get(k, None)
-                    if a in cols:
-                        resolved[k] = a
-                        continue
-                    return False
-                # R2-D21: the shard must hold enough rows for every episode
-                # slice it serves; otherwise _load_ep_parquet's iloc would
-                # return short frames → IndexError mid-training.
-                span = _shard_span.get((ci, fi))
-                if span is not None:
-                    try:
-                        n_rows = int(pf.metadata.num_rows)
-                    except Exception:
-                        return False
-                    need_rows = span[1] - span[0]
-                    if n_rows < need_rows:
-                        logger.warning(
-                            "[v30-adapter] %s: shard %s has %d rows but "
-                            "meta/episodes requires %d (span [%d, %d)) — "
-                            "dropping shard (meta/data inconsistency).",
-                            repo_id, p.name, n_rows, need_rows, span[0], span[1],
-                        )
-                        return False
-                # R2-D7: overwide-column probe on the first row.
-                if _check_overwide and _declared_dim:
-                    try:
-                        probe_cols = [
-                            resolved[k] for k in _declared_dim if k in resolved
-                        ]
-                        if probe_cols and pf.metadata.num_row_groups > 0:
-                            head = pf.read_row_group(0, columns=probe_cols)
-                            if len(head) > 0:
-                                for k in _declared_dim:
-                                    if k not in resolved:
-                                        continue
-                                    raw0 = head.column(resolved[k])[0].as_py()
-                                    if (isinstance(raw0, (list, tuple))
-                                            and len(raw0) > _declared_dim[k]):
-                                        logger.warning(
-                                            "[v30-adapter] %s: shard %s column "
-                                            "%r is %d-wide > declared %d — "
-                                            "dropping shard (set "
-                                            "LABVLA_ALLOW_TRUNCATE=1 to keep "
-                                            "and truncate).",
-                                            repo_id, p.name, resolved[k],
-                                            len(raw0), _declared_dim[k],
-                                        )
-                                        return False
-                    except Exception:
-                        return False
-                return True
+        # Per-read-key declared dims (SOURCE space when declared, mirroring
+        # what the projection actually reads) for the overwide check, matching
+        # v21's _parquet_ok. Without it an overwide shard crashes later in
+        # _pad_row mid-training instead of being dropped at init. Honors
+        # LABVLA_ALLOW_TRUNCATE.
+        _rs_dims = (
+            tuple(getattr(schema, "source_state_dims", ()) or ())
+            or tuple(getattr(schema, "state_dims", ()) or ())
+        )
+        _ra_dims = (
+            tuple(getattr(schema, "source_action_dims", ()) or ())
+            or tuple(getattr(schema, "action_dims", ()) or ())
+        )
+        _declared_dim: dict[str, int] = {}
+        for _k, _d in zip(read_state_keys, _rs_dims):
+            _declared_dim[_k] = int(_d)
+        for _k, _d in zip(read_action_keys, _ra_dims):
+            _declared_dim[_k] = int(_d)
+        # The overwide probe below resolves `needed` (physical names) — attach
+        # each virtual state key's declared dim to its physical source column
+        # so the probe still covers it. setdefault: a column with its own
+        # schema-declared dim keeps that dim.
+        for _vk, _vsrc in (
+            getattr(schema, "virtual_state_sources", None) or {}
+        ).items():
+            if _vk in _declared_dim:
+                _declared_dim.setdefault(str(_vsrc), _declared_dim[_vk])
+        from src.utils import env_flags as _env_flags
+        _check_overwide = _env_flags.get("LABVLA_ALLOW_TRUNCATE") != "1"
 
-            # Disk-persistent scan cache (v3 variant — keyed by ok_shards).
-            # Reuses the v21 infrastructure; v3 has no chunks_size, so -1 sentinel.
-            from .lerobot_v21 import (
-                _scan_cache_key, _load_scan_cache, _save_scan_cache,
-            )
-            cache_key = _scan_cache_key(
-                self.meta_root,
-                schema_id=getattr(schema, "schema_id", "unknown"),
-                chunks_size=-1,   # v3 sentinel
+        def _shard_ok(ci: int, fi: int) -> bool:
+            # Shim binding the phase-local context to module-level _shard_ok_v30.
+            return _shard_ok_v30(
+                ci, fi,
                 data_root=self.data_root,
-            )
-            cache_key["required_columns"] = list(needed)
-            # R2-D21/D7: scan semantics now include the row-span + overwide
-            # checks; bump the key so caches written by the old scan invalidate.
-            cache_key["integrity_checks"] = 2
-            cached = _load_scan_cache(self.meta_root, cache_key)
-
-            unique_shards = {
-                (int(e["data/chunk_index"]), int(e["data/file_index"]))
-                for e in self._episodes
-            }
-
-            # The cache packs (ci, fi) as ``ci*_PACK_BASE + fi`` — unambiguous
-            # only while fi < _PACK_BASE. Assert loudly so >1M-shards-per-chunk
-            # datasets fail at launch instead of mis-filtering silently.
-            _PACK_BASE = 1_000_000
-            max_fi = max((fi for (_, fi) in unique_shards), default=0)
-            assert max_fi < _PACK_BASE, (
-                f"[v30-adapter] shard fi={max_fi} ≥ cache pack base {_PACK_BASE}; "
-                f"cache collision risk — update encoding before reusing."
+                needed=needed,
+                alt=alt,
+                shard_span=_shard_span,
+                declared_dim=_declared_dim,
+                check_overwide=_check_overwide,
+                repo_id=repo_id,
             )
 
-            if cached is not None:
-                # Reuse the v21 cache's `existing_episodes` slot as our
-                # ok_shards set (packed ints).
-                _packed_ok = cached[1]
-                ok_shards = {(p // _PACK_BASE, p % _PACK_BASE) for p in _packed_ok}
-                # Intersect with the current episode set, which can drift
-                # without a schema change (which would invalidate the cache).
-                ok_shards = ok_shards & unique_shards
-            else:
-                ok_shards = {s for s in unique_shards if _shard_ok(*s)}
-                _packed_ok = {ci * _PACK_BASE + fi for (ci, fi) in ok_shards}
-                _save_scan_cache(
-                    self.meta_root, cache_key, chunk_ok={}, existing_episodes=_packed_ok,
-                )
+        # Disk-persistent scan cache (v3 variant — keyed by ok_shards). Shared
+        # infrastructure in adapters/_scan_cache.py; v3 has no chunks_size, so
+        # -1 sentinel.
+        from ._scan_cache import (
+            _scan_cache_key, _load_scan_cache, _save_scan_cache,
+        )
+        cache_key = _scan_cache_key(
+            self.meta_root,
+            schema_id=getattr(schema, "schema_id", "unknown"),
+            chunks_size=-1,   # v3 sentinel
+            data_root=self.data_root,
+        )
+        cache_key["required_columns"] = list(needed)
+        # Scan semantics include the row-span check, overwide check, declared
+        # dims and env gates; bump to invalidate caches written by an older
+        # scan version.
+        cache_key["integrity_checks"] = 3
+        cache_key["declared_dims"] = sorted(
+            (str(k), int(v)) for k, v in (_declared_dim or {}).items()
+        )
+        cached = _load_scan_cache(self.meta_root, cache_key)
 
-            if ok_shards != unique_shards:
-                keep = [e for e in self._episodes
-                        if (int(e["data/chunk_index"]), int(e["data/file_index"])) in ok_shards]
-                dropped = len(self._episodes) - len(keep)
-                logger.warning(
-                    "[v30-adapter] %s: dropped %d/%d episodes in %d shards "
-                    "lacking schema-required columns (%s)",
-                    repo_id, dropped, len(self._episodes),
-                    len(unique_shards) - len(ok_shards), needed,
-                )
-                self._episodes = keep
-                self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
+        unique_shards = {
+            (int(e["data/chunk_index"]), int(e["data/file_index"]))
+            for e in self._episodes
+        }
 
-        # Task-uniform support: restrict to a user-supplied episode subset.
-        if episode_filter is not None:
-            allowed = {int(i) for i in episode_filter}
-            before = len(self._episodes)
-            self._episodes = [
-                ep for ep in self._episodes
-                if int(ep.get("episode_index", -1)) in allowed
-            ]
+        # The cache packs (ci, fi) as ``ci*_PACK_BASE + fi`` — unambiguous
+        # only while fi < _PACK_BASE. Assert loudly so >1M-shards-per-chunk
+        # datasets fail at launch instead of mis-filtering silently.
+        _PACK_BASE = 1_000_000
+        max_fi = max((fi for (_, fi) in unique_shards), default=0)
+        assert max_fi < _PACK_BASE, (
+            f"[v30-adapter] shard fi={max_fi} ≥ cache pack base {_PACK_BASE}; "
+            f"cache collision risk — update encoding before reusing."
+        )
+
+        if cached is not None:
+            # Reuse the v21 cache's `existing_episodes` slot as our
+            # ok_shards set (packed ints).
+            _packed_ok = cached[1]
+            ok_shards = {(p // _PACK_BASE, p % _PACK_BASE) for p in _packed_ok}
+            # Intersect with the current episode set, which can drift
+            # without a schema change (which would invalidate the cache).
+            ok_shards = ok_shards & unique_shards
+        else:
+            ok_shards = {s for s in unique_shards if _shard_ok(*s)}
+            _packed_ok = {ci * _PACK_BASE + fi for (ci, fi) in ok_shards}
+            _save_scan_cache(
+                self.meta_root, cache_key, chunk_ok={}, existing_episodes=_packed_ok,
+            )
+
+        if ok_shards != unique_shards:
+            keep = [e for e in self._episodes
+                    if (int(e["data/chunk_index"]), int(e["data/file_index"])) in ok_shards]
+            dropped = len(self._episodes) - len(keep)
+            logger.warning(
+                "[v30-adapter] %s: dropped %d/%d episodes in %d shards "
+                "lacking schema-required columns (%s)",
+                repo_id, dropped, len(self._episodes),
+                len(unique_shards) - len(ok_shards), needed,
+            )
+            self._episodes = keep
             self._ep_starts, self._ep_lens = _ep_starts_lens(self._episodes)
-            logger.info(
-                "[v30-adapter] %s: episode_filter kept %d/%d episodes",
-                repo_id, len(self._episodes), before,
-            )
 
-        self._drop_terminal_samples_for_next_frame_actions(schema)
+    def _finalize_meta_and_caches(self, stats, schema) -> None:
+        """Phase 4: feature/camera keys, fps gate, DatasetMeta, shard
+        offsets + column projection, video/shard caches, shared counters."""
+        info = self._info
+        repo_id = self.repo_id
 
         feats = info.get("features", {}) or {}
         video_keys = [
@@ -611,11 +656,9 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
         self._ep_by_idx = {int(e["episode_index"]): e for e in self._episodes}
 
         # Per-shard global→local offset. `dataset_from_index` is cumulative
-        # across the dataset, but each shard's parquet rows are numbered
-        # 0..N_shard-1; _load_ep_parquet subtracts this offset before iloc.
-        # Computed from UNFILTERED episodes: if episode_filter drops the first
-        # episode in a shard, the original min dataset_from_index still applies
-        # (parquet rows don't shift).
+        # over the WHOLE dataset while each shard's rows are locally numbered;
+        # offset = min(dataset_from_index) over ALL (unfiltered) episodes in
+        # the shard — see _load_ep_parquet.
         self._shard_offsets: dict[tuple[int, int], int] = {}
         for _e in self._unfiltered_episodes:
             _key = (int(_e["data/chunk_index"]), int(_e["data/file_index"]))
@@ -637,12 +680,23 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
                 tuple(getattr(schema, "source_action_keys", ()) or ())
                 or tuple(getattr(schema, "action_keys", ()) or ())
             )
+            # Project the PHYSICAL source column for virtual state keys (a
+            # virtual name never exists in the shard; projecting it would
+            # silently drop the real source from the read).
             for k in read_state_keys:
-                needed.add(self._required_parquet_key(k))
+                needed.add(self._resolve_physical_column(schema, k))
             for k in read_action_keys:
-                needed.add(self._required_parquet_key(k))
-            # Canonical siblings so the pluralization normalization can reach them.
-            needed.update({"observation.state", "state", "action", "actions"})
+                needed.add(self._resolve_physical_column(schema, k))
+            # Canonical siblings so the pluralization normalization can reach
+            # them — ONLY when the schema actually reads a canonical-named
+            # column. For fully non-canonical read sets (e.g. oxe-auge reads
+            # only observation.joints), an unconditional update would drag the
+            # heterogeneous raw observation.state through every sample dict
+            # until ComposeFieldsTransform overwrote it — wasted shard I/O and
+            # a trap for any future transform that iterates all dict keys.
+            _canonical_siblings = {"observation.state", "state", "action", "actions"}
+            if needed & _canonical_siblings:
+                needed.update(_canonical_siblings)
         # Task resolution needs task_index (→ tasks.parquet) or
         # natural_language_instruction; include both.
         needed.update({"task_index", "natural_language_instruction", "task"})
@@ -651,8 +705,8 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
                 field = getattr(spec, "field", None)
                 if field:
                     needed.add(str(field))
-            # R2-D19 fix: "annotation.unified" is SYNTHESIZED at transform time
-            # by BuildUnifiedAnnotationTransformFn from the raw per-field
+            # "annotation.unified" is SYNTHESIZED at transform time by
+            # BuildUnifiedAnnotationTransformFn from the raw per-field
             # annotation columns — projecting only the synthesized name would
             # drop the raw columns from the shard read, and the builder would
             # silently emit an empty string (zero annotation CE). Project the
@@ -662,8 +716,11 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
                 getattr(spec, "field", None) == "annotation.unified"
                 for spec in getattr(schema, "annotation_losses", ()) or ()
             ):
-                from transforms.build_unified_annotation import (
-                    _DEFAULT_FIELDS as _UNIFIED_RAW_FIELDS,
+                # The source-field list is schema-layer data (shared by the
+                # transform that synthesizes annotation.unified and this
+                # projection) — import it from schema, not from transforms.
+                from src.schema.annotation_loss import (
+                    UNIFIED_ANNOTATION_FIELDS as _UNIFIED_RAW_FIELDS,
                 )
                 needed.update(str(f) for f in _UNIFIED_RAW_FIELDS)
         # Minimal metadata for any downstream transform that inspects index.
@@ -686,6 +743,7 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
 
         # Warn once per (repo, horizon) if the longest offset clips past most
         # of the shortest episode. See base class.
+        self._validate_delta_timestamps_frame_aligned()  # M15
         self._validate_delta_timestamps_vs_episode_lens()
 
         # Process-wide PyAV container LRU (shared with v21): frames within a
@@ -694,13 +752,13 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
         self._video_cache = _get_shared_video_cache()
         self._video_cache_owner_id = id(self)
 
-        # R2-D2: fork-shared zero-frame fallback counter (must exist before
-        # DataLoader workers fork so worker increments reach the main process).
+        # Fork-shared zero-frame fallback counter (must exist before DataLoader
+        # workers fork so worker increments reach the main process).
         self._init_zero_frame_shared()
 
-        # R2-D5 fix: per-INSTANCE shard LRU (see lerobot_v21 for rationale —
-        # the class-level @lru_cache shared 64 slots across every adapter in a
-        # mixture and pinned `self` references in a class-level cache).
+        # Per-INSTANCE shard LRU (see lerobot_v21 for rationale — a class-level
+        # @lru_cache would share 64 slots across every adapter in a mixture and
+        # pin `self` references in a class-level cache).
         self._load_shard = lru_cache(maxsize=64)(self._load_shard_uncached)
 
     def _close_video_containers(self) -> None:
@@ -722,7 +780,7 @@ class LeRobotV30Adapter(LeRobotAdapterBase):
 
     # ---- shard-sliced parquet loader (overrides v21) ----
 
-    # Bound per-instance in __init__ via lru_cache(maxsize=64) — R2-D5.
+    # Bound per-instance in __init__ via lru_cache(maxsize=64).
     def _load_shard_uncached(self, ci: int, fi: int) -> pd.DataFrame:
         """Whole-shard DataFrame, LRU-cached at 64 shards (a BS=64 batch spans
         many short oxe-auge episodes).

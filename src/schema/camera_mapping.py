@@ -1,10 +1,9 @@
 """Camera-mapping SSOT — expand short alias → full `observation.images.imageN`.
 
-Before Plan-B, the same "alias expansion" logic was reimplemented three times
-(blueprint compiler, manifest parser, Tier-2 info.json auto-inferrer) and the
-info.json reverse-check/validation was spread across a fourth file
-(discovery.py). Subtle drift between copies caused silent key-mismatch bugs
-at adapter time. This module is the single source of truth.
+Single source of truth for "alias expansion" logic (used by the blueprint
+compiler, manifest parser, and Tier-2 info.json auto-inferrer) plus the
+info.json reverse-check/validation. Keeping one copy avoids silent
+key-mismatch bugs at adapter time.
 
 Conventions
 -----------
@@ -14,9 +13,9 @@ A camera "target" is a string. It is either:
   - Already a fully qualified slot key like ``"observation.images.image0"``.
     Kept as-is.
 
-C34 note: the only valid target slot form is ``imageN`` (N a non-negative
-integer). Non-numeric aliases such as ``"image_left"`` are NOT accepted —
-the schema validator (``schema/validate.py::_IMAGE_TARGET_RE``) only admits
+The only valid target slot form is ``imageN`` (N a non-negative integer).
+Non-numeric aliases such as ``"image_left"`` are NOT accepted — the schema
+validator (``schema/validate.py::_IMAGE_TARGET_RE``) only admits
 ``observation.images.imageN``, and the downstream Qwen3VL processor iterates a
 fixed set of numbered slots. ``expand_camera_target`` rejects non-``imageN``
 aliases at authoring time so the camera-mapping contract matches the validator
@@ -40,10 +39,10 @@ from __future__ import annotations
 import re
 from typing import Mapping
 
-from utils.constants import OBS_IMAGES
+from src.utils.constants import OBS_IMAGES
 
 
-# C34: a target slot alias must be ``imageN`` (N a non-negative integer). This
+# A target slot alias must be ``imageN`` (N a non-negative integer). This
 # mirrors ``schema/validate.py::_IMAGE_TARGET_RE`` (which matches the fully
 # qualified ``observation.images.imageN``) so the authoring contract and the
 # validator agree.
@@ -67,7 +66,7 @@ def expand_camera_target(raw: str, target: str) -> str:
         target: Either a short numeric-slot alias (``"image0"``) or a full
             ``observation.images.image0`` key. Non-string / empty values
             raise ``ValueError``. Non-``imageN`` short aliases (e.g.
-            ``"image_left"``) are rejected (C34).
+            ``"image_left"``) are rejected.
 
     Returns:
         The fully qualified ``observation.images.imageN`` key.
@@ -80,10 +79,9 @@ def expand_camera_target(raw: str, target: str) -> str:
         # Already fully qualified — pass through verbatim. The schema validator
         # still enforces the ``imageN`` slot form on it.
         return target
-    # C34 fix: a short alias must be ``imageN``. Previously any alias was
-    # expanded (e.g. ``image_left`` → ``observation.images.image_left``), which
-    # the validator then rejected deep inside ``DatasetSchema.__post_init__``.
-    # Reject it here, at authoring time, with an actionable message.
+    # A short alias must be ``imageN``. Reject anything else here, at authoring
+    # time, with an actionable message — otherwise it would be rejected deep
+    # inside ``DatasetSchema.__post_init__``.
     if _IMAGE_SLOT_ALIAS_RE.match(target) is None:
         raise ValueError(
             f"camera target for {raw!r} must be a numbered slot alias "
@@ -141,12 +139,12 @@ def expand_camera_mapping(mapping: Mapping[str, str]) -> dict[str, str]:
     are preserved verbatim. The returned dict is a fresh copy — callers
     may mutate freely.
 
-    Note: prior to the Apr-2026 fix, only the value was expanded. Source
-    keys for legacy schemas (e.g. labutopia_level3 with
-    ``cameras={"camera_1_rgb": "image0"}``) stayed unprefixed, leaving
-    adapters and downstream transforms iterating two different key shapes.
-    Both sides are now normalized to the unified ``observation.images.<x>``
-    form so adapter writes and ``RemapImageKeyTransformFn`` reads agree.
+    Both the source key and the target are normalized to the unified
+    ``observation.images.<x>`` form so adapter writes and
+    ``RemapImageKeyTransformFn`` reads agree. (Expanding only the value left
+    legacy schemas like ``cameras={"camera_1_rgb": "image0"}`` with an
+    unprefixed source key, so adapters and transforms iterated two different
+    key shapes.)
     """
     return {
         expand_camera_source(raw): expand_camera_target(raw, target)

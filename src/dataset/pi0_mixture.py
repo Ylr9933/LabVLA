@@ -1,9 +1,7 @@
 """π0-style volume-weighted multi-dataset mixing.
 
-Implements the processor-granularity n^0.43 formula from:
-  - π0 paper, Section V-A: "we weight each task-robot combination by n^0.43"
-  - Reference impl: /all-flash-data/LabVLA/pretrain_pi0/data_processors/
-    pretrain_dataset.py:66-73 (weight formula) and :149-151 (sampling).
+Implements the processor-granularity n^0.43 formula from the π0 paper
+(Section V-A: "we weight each task-robot combination by n^0.43").
 
 Unlike MultiLeRobotDataset (concat-by-length) or MultiStreamingLeRobotDataset
 (IterableDataset), this is a map-style Dataset that performs weighted random
@@ -181,11 +179,11 @@ class PI0MixtureDataset(Dataset):
 class PI0MixtureBatchSampler(Sampler[list[tuple[int, int]]]):
     """Homogeneous mini-batches for ``PI0MixtureDataset``.
 
-    Phase-A memory fix: choose exactly one source dataset per mini-batch, then
-    sample all local indices from that source. This preserves π0-style
-    weighted mixture semantics at the batch level while preventing one
-    heterogeneous collate from taking the union of every annotation/FAST field
-    across unrelated dataset schemas.
+    Choose exactly one source dataset per mini-batch, then sample all local
+    indices from that source. This preserves π0-style weighted mixture
+    semantics at the batch level while preventing one heterogeneous collate
+    from taking the union of every annotation/FAST field across unrelated
+    dataset schemas.
     """
 
     def __init__(

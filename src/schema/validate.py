@@ -1,10 +1,9 @@
 """Schema-layer validators — single source of truth.
 
-Before Plan-B, validation logic was duplicated inside
-``DatasetSchema.__post_init__``, ``ArmLayoutSpec.__post_init__``, and the
-manifest parser. This module extracts every structural check into two
-functions so callers (constructors, manifest loaders, future CLI verifiers)
-share one code path.
+Every structural check lives here in two functions so callers
+(``DatasetSchema.__post_init__``, ``ArmLayoutSpec.__post_init__``, the manifest
+parser, and future CLI verifiers) share one code path instead of duplicating
+the logic.
 
 Both validators raise ``SchemaValidationError`` on failure. That class
 inherits from ``ValueError`` for backward compatibility with code that
@@ -19,7 +18,7 @@ from typing import TYPE_CHECKING, Optional
 from .annotation_loss import AnnotationLossSpec
 from .arm_layout import ArmCount, ArmLayoutSpec
 from .errors import SchemaValidationError
-from utils.constants import NUM_IMAGE_SLOTS
+from src.utils.constants import NUM_IMAGE_SLOTS
 
 if TYPE_CHECKING:  # avoid import cycle — DatasetSchema imports validate_schema
     from .dataset_schema import DatasetSchema
@@ -170,10 +169,9 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
             )
         declared_slots.add(idx)
 
-    # Claim 11 fix: image_mapping must cover the slots {0, 1, ..., k-1} for
-    # some k ≥ 1 — i.e. start at image0 and have no holes. The transform
-    # pipeline (RemapImageKeyTransformFn at src/transforms/core.py:~290 and
-    # transform_labvla.py:~81) hard-references `observation.images.image0`
+    # image_mapping must cover the slots {0, 1, ..., k-1} for some k ≥ 1 —
+    # i.e. start at image0 and have no holes. The transform pipeline
+    # (RemapImageKeyTransformFn) hard-references `observation.images.image0`
     # as the zero-frame template for padded slots, and iterates
     # `range(num_image_slots)` reading `<key>_mask` for each i. A schema
     # that declares only `image1` would pass the per-target checks above
@@ -203,12 +201,11 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
             f"{prefix}action_keys length {len(schema.action_keys)} != "
             f"action_dims length {len(schema.action_dims)} for schema_id={sid!r}"
         )
-    # R2-D15: state_keys and action_keys must be DISJOINT. A shared key would
-    # be overwritten by DeltaActionTransformFn with the delta chunk (whose
+    # state_keys and action_keys must be DISJOINT. A shared key would be
+    # overwritten by DeltaActionTransformFn with the delta chunk (whose
     # row 0 is identically 0 for masked dims), so ComposeFieldsTransform would
-    # then build OBS_STATE from a destroyed state — a silent P0-class
-    # corruption. No registered schema overlaps (oxe-auge uses
-    # observation.state vs observation.joints); reject any future one here.
+    # then build OBS_STATE from a destroyed state — a silent corruption.
+    # Reject any overlap here.
     _overlap = set(schema.state_keys) & set(schema.action_keys)
     if _overlap:
         raise SchemaValidationError(
@@ -219,6 +216,49 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
             f"needs. Give the state and action distinct (possibly source-remapped) "
             f"columns."
         )
+    # Duplicate keys would silently let a later stats slice overwrite an
+    # earlier one in NormalizeTransformFn's per-key slicing.
+    for _name, _keys in (("state_keys", schema.state_keys),
+                         ("action_keys", schema.action_keys)):
+        if len(set(_keys)) != len(_keys):
+            raise SchemaValidationError(
+                f"{prefix}{_name} contains duplicate keys: {list(_keys)!r} "
+                f"for schema_id={sid!r}"
+            )
+    # source_state_keys/source_action_keys must come as a pair: training-side
+    # canonicalization enables only when BOTH are non-empty, while the stats
+    # CLI canonicalizes on EITHER — a half-declared schema silently trains on
+    # raw layout but computes canonical stats. Structural pairing is not
+    # enough either — the arm_layout must be GEOMETRICALLY consistent with the
+    # declared source widths, else the canonicalization transform mis-slices
+    # at runtime.
+    _al = getattr(schema, "arm_layout", None)
+    if _al is not None and getattr(_al, "arm_dof", None) is not None:
+        _src_state_total = sum(int(d) for d in (schema.source_state_dims or ()))
+        _grip_idx = getattr(_al, "gripper_index_in_raw", None)
+        if _src_state_total:
+            if int(_al.arm_dof) > _src_state_total:
+                raise SchemaValidationError(
+                    f"{prefix}arm_layout.arm_dof={_al.arm_dof} exceeds the "
+                    f"total source state width {_src_state_total} "
+                    f"(schema_id={sid!r}; M94)"
+                )
+            if _grip_idx is not None and int(_grip_idx) >= _src_state_total:
+                raise SchemaValidationError(
+                    f"{prefix}arm_layout.gripper_index_in_raw={_grip_idx} is "
+                    f"out of range for total source state width "
+                    f"{_src_state_total} (schema_id={sid!r}; M94)"
+                )
+    if bool(schema.source_state_keys) != bool(schema.source_action_keys):
+        raise SchemaValidationError(
+            f"{prefix}source_state_keys and source_action_keys must be "
+            f"declared together (got state={list(schema.source_state_keys)!r}, "
+            f"action={list(schema.source_action_keys)!r}) for "
+            f"schema_id={sid!r}: training-side canonicalization enables only "
+            f"when both are set, while the stats pipeline canonicalizes on "
+            f"either — the two stacks would diverge."
+        )
+
     # Canonical state/action dims must be strictly positive.
     # Previously only source_state_dims/source_action_dims were checked; a
     # schema with action_dims=(0,) and delta_mask=() could pass validation
@@ -269,6 +309,66 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
                 f"{prefix}{label}_dims must be positive for schema_id={sid!r}, "
                 f"got {dims}"
             )
+    # Virtual state columns. The adapter materializes each mapping key at
+    # __getitem__ time from a physical same-frame column; these rules keep
+    # the indirection single-level and unambiguous:
+    #   - every mapping key uses the "virtual." prefix (can never shadow a
+    #     physical parquet column);
+    #   - every mapping key is actually consumed (∈ state_keys);
+    #   - action keys stay physical (delta/chunk machinery reads disk);
+    #   - sources are physical, non-empty strings (no virtual→virtual chains);
+    #   - every "virtual."-prefixed state key has a mapping entry (otherwise
+    #     the adapter has nothing to materialize it from);
+    #   - virtual keys do not combine with source_state_keys (a schema with a
+    #     canonicalizing source layout already owns its state construction —
+    #     supporting both at once would create two competing writers).
+    vss = getattr(schema, "virtual_state_sources", None) or {}
+    if vss and schema.source_state_keys:
+        raise SchemaValidationError(
+            f"{prefix}schema_id={sid!r}: virtual_state_sources cannot be "
+            f"combined with source_state_keys — the canonical-state transform "
+            f"and the virtual-column materializer would both claim ownership "
+            f"of the state keys."
+        )
+    for vkey, vsrc in vss.items():
+        if not str(vkey).startswith("virtual."):
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: virtual_state_sources key "
+                f"{vkey!r} must use the 'virtual.' prefix so it can never "
+                f"collide with a physical parquet column."
+            )
+        if vkey not in schema.state_keys:
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: virtual_state_sources key "
+                f"{vkey!r} is not in state_keys {schema.state_keys!r} — a "
+                f"virtual column that nothing consumes is a schema bug."
+            )
+        if not isinstance(vsrc, str) or not vsrc:
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: virtual_state_sources[{vkey!r}] "
+                f"must be a non-empty physical column name, got {vsrc!r}."
+            )
+        if vsrc.startswith("virtual."):
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: virtual_state_sources[{vkey!r}] "
+                f"source {vsrc!r} is itself virtual — chains are not "
+                f"supported; point every virtual key at a physical column."
+            )
+    for k in schema.state_keys:
+        if str(k).startswith("virtual.") and k not in vss:
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: state key {k!r} uses the "
+                f"'virtual.' prefix but has no virtual_state_sources entry — "
+                f"the adapter would have nothing to materialize it from."
+            )
+    for k in schema.action_keys:
+        if str(k).startswith("virtual."):
+            raise SchemaValidationError(
+                f"{prefix}schema_id={sid!r}: action key {k!r} uses the "
+                f"'virtual.' prefix; virtual columns are state-only (the "
+                f"delta/chunking machinery must read physical disk columns)."
+            )
+
     for idx in schema.gripper_action_dims:
         if not (0 <= idx < total_action_dim):
             raise SchemaValidationError(
@@ -300,9 +400,9 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
             )
         seen_fields.add(spec.field)
 
-    # M-A-4: gripper_semantic, when provided, must be one of the recognized
-    # values. Typos like "veloctiy" would silently disable the cross-dataset
-    # semantic guard otherwise.
+    # gripper_semantic, when provided, must be one of the recognized values.
+    # Typos like "veloctiy" would silently disable the cross-dataset semantic
+    # guard otherwise.
     if schema.gripper_semantic is not None:
         allowed = ("velocity", "width", "position", "open_fraction", "binary")
         if schema.gripper_semantic not in allowed:
@@ -332,13 +432,11 @@ def validate_schema(schema: "DatasetSchema", context: Optional[str] = None) -> N
                     f"for schema_id={sid!r}"
                 )
         elif schema.arm_layout.arm_count == ArmCount.DUAL:
-            # C26 fix: a DUAL arm_layout has no single-arm gripper_index_in_raw
-            # (it is None). Reading it here used to make a dual-arm schema that
-            # carries a legitimate ArmLayoutSpec(DUAL, ...) but no
-            # source_action_keys fail the check unconditionally. A dual-arm
-            # schema with no canonicalization already exposes its action vector
-            # in canonical order, so its gripper dims must match the canonical
-            # dual-arm gripper indices (6, 13).
+            # A DUAL arm_layout has no single-arm gripper_index_in_raw (it is
+            # None), so handle it separately. A dual-arm schema with no
+            # canonicalization already exposes its action vector in canonical
+            # order, so its gripper dims must match the canonical dual-arm
+            # gripper indices (6, 13).
             canonical_gripper = set(schema.arm_layout.gripper_indices_canonical)
             if declared_gripper != canonical_gripper:
                 raise SchemaValidationError(

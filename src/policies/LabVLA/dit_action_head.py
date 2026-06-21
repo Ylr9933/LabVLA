@@ -330,9 +330,8 @@ class DiTActionHead(nn.Module):
                 )
 
         # Output shift/scale conditioning. Keep this order for compatibility
-        # with existing LabVLA checkpoints trained before 2026-05-30: their
-        # proj_out_1 weights were learned with the first half as shift and
-        # the second half as scale.
+        # with existing LabVLA checkpoints: their proj_out_1 weights were learned
+        # with the first half as shift and the second half as scale.
         shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=-1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
 
