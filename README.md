@@ -97,8 +97,7 @@
 - [x] Model weights on Hugging Face
 - [x] Inference & deployment code
 - [x] **Training & fine-tuning code**
-- [ ] **RoboGenesis** — *coming soon*
-- [ ] **labembodied-data** — *coming soon*
+- [ ] **RoboGenesis** & **labembodied-data** — *coming soon*
 
 The full training, post-training, and fine-tuning code is now available — see [Training](#-training). RoboGenesis and labembodied-data are being organized and will follow soon.
 
@@ -124,13 +123,13 @@ pip install -r requirements.txt
 **1. Download** the model from Hugging Face:
 
 ```bash
-huggingface-cli download zjunlp/LabVLA --local-dir LabVLA
+huggingface-cli download zjunlp/LabVLA-5B-Base --local-dir LabVLA-5B-Base
 ```
 
 **2. Deploy** — start a WebSocket inference server:
 
 ```bash
-PRETRAINED_PATH=/path/to/LabVLA bash deployment/deploy.sh
+PRETRAINED_PATH=LabVLA-5B-Base bash deployment/deploy.sh
 ```
 
 **3. Evaluate** — connect your robot or simulator client to the server and run rollouts. See [Deployment](#-deployment) for configuration details.
