@@ -97,7 +97,7 @@
 - [x] Model weights on Hugging Face
 - [x] Inference & deployment code
 - [x] **Training & fine-tuning code**
-- [ ] **RoboGenesis** & **labembodied-data** — *coming soon*
+- [ ] **RoboGenesis** & **LabEmbodied-Data** — *coming soon*
 
 The full training, post-training, and fine-tuning code is now available — see [Training](#-training). RoboGenesis and labembodied-data are being organized and will follow soon.
 
