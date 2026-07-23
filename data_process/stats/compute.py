@@ -188,6 +188,46 @@ def _iter_abs_action_chunks(acts_ep, states_ep, chunk_size):
         yield np.concatenate(pieces, axis=0)
 
 
+def _canonicalize_jaka_states(states_ep, schema):
+    """Mirror the training transform's 8-D JAKA state layout."""
+    if getattr(schema, "schema_id", None) != "jaka_v21_arm_only":
+        return states_ep
+    out = []
+    for st in states_ep:
+        if st.ndim != 2 or st.shape[-1] != 8:
+            raise ValueError(
+                "JAKA stats expected raw state [6 joints + 2 gripper channels], "
+                f"got shape {st.shape}."
+            )
+        canonical = np.zeros(
+            st.shape[:-1] + (sum(schema.state_dims),), dtype=np.float32
+        )
+        canonical[:, :6] = st[:, :6]
+        canonical[:, -1] = st[:, 7]
+        out.append(canonical)
+    return out
+
+
+def _canonicalize_jaka_actions(acts_ep, schema):
+    """Mirror the training transform's 8-D JAKA action layout."""
+    if getattr(schema, "schema_id", None) != "jaka_v21_arm_only":
+        return acts_ep
+    out = []
+    for act in acts_ep:
+        if act.ndim != 2 or act.shape[-1] != 7:
+            raise ValueError(
+                "JAKA stats expected raw action [6 joints + gripper], "
+                f"got shape {act.shape}."
+            )
+        canonical = np.zeros(
+            act.shape[:-1] + (sum(schema.action_dims),), dtype=np.float32
+        )
+        canonical[:, :6] = act[:, :6]
+        canonical[:, -1] = act[:, 6]
+        out.append(canonical)
+    return out
+
+
 def _clear_stats_invalidated(ds_root: Path) -> None:
     """Remove the ``stats_invalidated`` block left by ``cleanup.apply`` after a
     successful stats recompute.
@@ -292,6 +332,11 @@ def main():
     acts_ep, states_ep, info = _read_by_version(args.dataset, schema)
     total_frames = sum(a.shape[0] for a in acts_ep)
     print(f"[stats] {len(acts_ep)} episodes, {total_frames} frames")
+
+    # JAKA has different raw state/action gripper layouts. Keep statistics in
+    # the same canonical space produced by JakaStateGripperTransformFn.
+    states_ep = _canonicalize_jaka_states(states_ep, schema)
+    acts_ep = _canonicalize_jaka_actions(acts_ep, schema)
 
     # Readers return RAW source-layout arrays for schemas that declare
     # source_*_keys; the delta_mask is CANONICAL. Canonicalize first so

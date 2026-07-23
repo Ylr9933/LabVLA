@@ -86,6 +86,21 @@ action 的 delta mask 为：
 这个文件已经是 8 维 canonical state/action 的统计量，训练脚本通过
 `--external_stats_path` 加载它。它不包含数据副本，也不会触发数据集重写。
 
+如果需要重新生成，使用项目自带的统计脚本：
+
+```bash
+cd /data1/xuezirui/dev/LabVLA_JAKA
+python -m data_process stats \
+    --dataset /data1/xuezirui/data_all/lerobot_v2_data_10 \
+    --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21.py:SCHEMA \
+    --chunk_size 50 \
+    --out /data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
+```
+
+这个命令只遍历原始数据并写入指定的统计 JSON，不会修改 parquet、视频或
+`meta/info.json`。统计脚本会和训练一样，将 state/action 转为 8 维后再计算
+`mean`、`std`、`q01`、`q99`，因此生成的统计文件可以直接给训练脚本使用。
+
 ## 5. 原数据保护
 
 训练过程只读取：
