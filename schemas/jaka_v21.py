@@ -12,7 +12,6 @@ SCHEMA = DatasetSchema(
     action_dims=(8,),
     delta_mask=(True, True, True, True, True, True, False, False),
     gripper_action_dims=(7,),
-    action_loss_mask=(True, True, True, True, True, True, False, True),
     image_mapping={"observation.images.front": "observation.images.image0"},
     source="manifest",
     source_path=__file__,
