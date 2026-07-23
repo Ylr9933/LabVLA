@@ -115,6 +115,7 @@ class LabVLADatasetConfig(DatasetConfig):
             )
             normalize_xform = NormalizeTransformFn(mode="mean_std")
             base_inputs = [
+                JakaStateGripperTransformFn(),
                 CanonicalArmLayoutTransformFn(),
                 CanonicalSingleArmLayoutTransformFn(),
                 DeltaActionTransformFn(),

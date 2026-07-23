@@ -811,6 +811,58 @@ class CanonicalSingleArmLayoutTransformFn(DataTransformFn):
         return t
 
 
+@DataTransformFn.register_subclass("jaka_state_gripper")
+@dataclass
+class JakaStateGripperTransformFn(DataTransformFn):
+    """Build JAKA's 8-D canonical vectors from its raw columns.
+
+    State uses ``observation.gripper[..., 1]`` (openness), while action uses
+    ``action[..., 6]``.  The seventh arm slot is reserved and filled with 0.
+    """
+
+    enabled: bool = False
+    state_key: str = "observation.joints"
+    gripper_key: str = "observation.gripper"
+    state_dim: int = 8
+    action_dim: int = 8
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.enabled:
+            return data
+        joints = data[self.state_key]
+        gripper = data[self.gripper_key]
+        action = data[ACTION]
+        if not isinstance(joints, torch.Tensor):
+            joints = torch.as_tensor(joints, dtype=torch.float32)
+        if not isinstance(gripper, torch.Tensor):
+            gripper = torch.as_tensor(gripper, dtype=torch.float32)
+        if not isinstance(action, torch.Tensor):
+            action = torch.as_tensor(action, dtype=torch.float32)
+        if joints.shape[-1] != 6 or gripper.shape[-1] != 2:
+            raise ValueError(
+                "JakaStateGripperTransformFn expects joints[...,6] and "
+                f"gripper[...,2], got {tuple(joints.shape)} and {tuple(gripper.shape)}"
+            )
+        if action.shape[-1] != 7:
+            raise ValueError(
+                "JakaStateGripperTransformFn expects raw action[...,7], "
+                f"got {tuple(action.shape)}"
+            )
+        data[OBS_STATE] = torch.cat(
+            [joints.to(torch.float32), torch.zeros_like(joints[..., :1]),
+             gripper[..., 1:2].to(torch.float32)], dim=-1
+        )
+        data[ACTION] = torch.cat(
+            [action[..., :6].to(torch.float32), torch.zeros_like(action[..., :1]),
+             action[..., 6:7].to(torch.float32)], dim=-1
+        )
+        return data
+
+    def hydrate(self, ctx: "HydrateContext") -> "JakaStateGripperTransformFn":
+        enabled = getattr(ctx.schema, "schema_id", None) == "jaka_v21_arm_only"
+        return replace(self, enabled=enabled)
+
+
 @DataTransformFn.register_subclass("pad_state_and_action")
 @dataclass
 class PadStateAndActionTransformFn(DataTransformFn):
