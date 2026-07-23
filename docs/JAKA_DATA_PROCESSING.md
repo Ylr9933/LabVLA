@@ -30,21 +30,7 @@ bash launch/finetune/train_jaka.sh
 `JakaStateGripperTransformFn` 完成字段映射。它们在样本进入归一化、delta
 计算和模型之前执行，因此不会修改源 parquet、视频或 `meta/info.json`。
 
-## 2. 为什么不只生成一个 JSON
-
-统计 JSON 和字段映射不是同一件事：
-
-```text
-stats_labvla_jaka_8d.json  只保存 mean/std/q01/q99 等归一化统计量
-jaka_v21.py                描述原始字段如何映射为模型输入
-JakaStateGripperTransformFn 实际执行这个映射
-```
-
-仅有 JSON 而没有训练代码读取它，不能表达 JAKA 的特殊情况：state 的夹爪
-来自 `observation.gripper[1]`，action 的夹爪来自 `action[6]`，两者原始索引
-并不相同。
-
-## 3. 输入数据
+## 2. 输入数据
 
 原始数据的 `meta/info.json` 需要声明以下字段：
 
@@ -66,7 +52,7 @@ observation.images.front  video
 脚本不会使用原始的 13 维 `observation.state` 作为模型输入，而是从
 `observation.joints` 和 `observation.gripper` 明确构造 canonical state。
 
-## 4. Canonical 布局
+## 3. Canonical 布局
 
 ### 无底盘
 
@@ -89,7 +75,7 @@ action 的 delta mask 为：
 [true, true, true, true, true, true, false, false]
 ```
 
-## 5. 服务于训练的统计 JSON
+## 4. 服务于训练的统计 JSON
 
 当前训练使用：
 
@@ -100,7 +86,7 @@ action 的 delta mask 为：
 这个文件已经是 8 维 canonical state/action 的统计量，训练脚本通过
 `--external_stats_path` 加载它。它不包含数据副本，也不会触发数据集重写。
 
-## 6. 原数据保护
+## 5. 原数据保护
 
 训练过程只读取：
 
