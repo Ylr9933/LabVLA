@@ -1,9 +1,53 @@
 # JAKA 数据处理
 
-本文档对应 `scripts/prepare_jaka_dataset.py`，用于把原始 LeRobot v2.1
-JAKA 数据转换为 LabVLA 使用的 canonical 数据集。
+本文档说明当前 JAKA 的训练数据链路。当前默认方案是训练时动态映射，原始
+LeRobot 数据直接读取，不需要先把整个数据集重写一遍。
 
-## 1. 输入数据
+`scripts/prepare_jaka_dataset.py` 仍然保留，作为需要生成独立 canonical 数据集
+时的可选离线工具；正常训练不依赖它。
+
+## 1. 当前训练方案
+
+训练脚本为：
+
+```text
+launch/finetune/train_jaka.sh
+```
+
+默认路径已经配置为：
+
+```text
+LabVLA: /data1/xuezirui/LabVLA-5B-Base
+Qwen:   /data/rbc/VLM/Qwen3-VL-4B-Instruct
+数据:   /data1/xuezirui/data_all/lerobot_v2_data_10
+```
+
+运行：
+
+```bash
+cd /data1/xuezirui/dev/LabVLA_JAKA
+bash launch/finetune/train_jaka.sh
+```
+
+训练时由 `schemas/jaka_v21.py` 和
+`JakaStateGripperTransformFn` 完成字段映射。它们在样本进入归一化、delta
+计算和模型之前执行，因此不会修改源 parquet、视频或 `meta/info.json`。
+
+## 2. 为什么不只生成一个 JSON
+
+统计 JSON 和字段映射不是同一件事：
+
+```text
+stats_labvla_jaka_8d.json  只保存 mean/std/q01/q99 等归一化统计量
+jaka_v21.py                描述原始字段如何映射为模型输入
+JakaStateGripperTransformFn 实际执行这个映射
+```
+
+仅有 JSON 而没有训练代码读取它，不能表达 JAKA 的特殊情况：state 的夹爪
+来自 `observation.gripper[1]`，action 的夹爪来自 `action[6]`，两者原始索引
+并不相同。
+
+## 3. 输入数据
 
 脚本要求源数据的 `meta/info.json` 声明以下字段：
 
@@ -26,7 +70,7 @@ observation.images.front  video
 脚本不会使用原始的 13 维 `observation.state` 作为模型输入，而是从
 `observation.joints` 和 `observation.gripper` 明确构造 canonical state。
 
-## 2. Canonical 布局
+## 4. Canonical 布局
 
 ### 无底盘
 
@@ -64,7 +108,18 @@ state/action = [joint_1..joint_6, 0, gripper_openness,
 底盘 action 为 `delta` 时，追加维度的 delta mask 为 `true`；为 `abs` 时
 为 `false`。机械臂前 6 维始终为 delta，夹爪始终为 absolute。
 
-## 3. 输出内容
+## 5. 服务于训练的统计 JSON
+
+当前训练使用：
+
+```text
+/data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
+```
+
+这个文件已经是 8 维 canonical state/action 的统计量，训练脚本通过
+`--external_stats_path` 加载它。它不包含数据副本，也不会触发数据集重写。
+
+## 6. 离线转换（可选）
 
 输出目录包含：
 
@@ -81,7 +136,7 @@ output/
 delta domain，`action_abs` 统计保留 absolute domain，并写入 `_chunk_size`
 用于训练时校验。
 
-## 4. 无底盘运行
+### 无底盘运行
 
 ```bash
 python scripts/prepare_jaka_dataset.py \
@@ -99,7 +154,7 @@ python scripts/prepare_jaka_dataset.py \
     --gripper_state_index 1
 ```
 
-## 5. 含底盘运行
+### 含底盘运行
 
 下面命令只表示参数形式。底盘 action 字段必须是真实的动作字段，不能
 把仅包含底盘观测的 `observation.agv` 当作 action 字段。
@@ -134,7 +189,7 @@ python scripts/prepare_jaka_dataset.py \
 索引越界、字段缺失、state/action 维度不一致、NaN/Inf、帧数不一致都会
 直接报错，不会静默填充或猜测。
 
-## 6. 原数据保护
+## 7. 原数据保护
 
 `--source` 只读。脚本只在 `--output` 中创建新数据、重写 parquet 和生成
 统计文件，不会修改源数据。
@@ -147,7 +202,7 @@ python scripts/prepare_jaka_dataset.py \
 
 这只会删除并重建 output，不会删除或修改 source。
 
-## 7. 已验证结果
+## 8. 已验证结果
 
 使用当前 JAKA 数据集验证：
 
