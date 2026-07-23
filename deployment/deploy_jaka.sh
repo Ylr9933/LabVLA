@@ -28,6 +28,7 @@ AUTH_TOKEN="${LABVLA_WS_AUTH_TOKEN:-${AUTH_TOKEN:-}}"
 DEFAULT_PROMPT="${DEFAULT_PROMPT:-}"
 NORM_STATS_PATH="${NORM_STATS_PATH:-}"
 TRAINING_REPO_ID="${TRAINING_REPO_ID:-}"
+SERVE_ENTRYPOINT="${SERVE_ENTRYPOINT:-serve_jaka.py}"
 
 if [ ! -d "${PRETRAINED_PATH}" ]; then
     echo "[ERROR] checkpoint directory not found: ${PRETRAINED_PATH}" >&2
@@ -60,7 +61,7 @@ export LABVLA_ROOT
 export PYTHONPATH="${LABVLA_ROOT}:${LABVLA_ROOT}/src"
 
 cmd=(
-    python "${DEPLOY_DIR}/serve_jaka.py"
+    python "${DEPLOY_DIR}/${SERVE_ENTRYPOINT}"
     --pretrained_path "${PRETRAINED_PATH}"
     --vlm_path "${VLM_PATH}"
     --host "${HOST}"

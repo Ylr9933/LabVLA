@@ -228,6 +228,48 @@ def _canonicalize_jaka_actions(acts_ep, schema):
     return out
 
 
+def _canonicalize_jaka_mobile_states(states_ep, schema):
+    """Mirror JakaMobileStateActionTransformFn for statistics."""
+    if getattr(schema, "schema_id", None) not in {
+        "jaka_v21_mobile", "jaka_v21_mobile_action9",
+    }:
+        return states_ep
+    out = []
+    for st in states_ep:
+        if st.ndim != 2 or st.shape[-1] != 17:
+            raise ValueError(
+                "JAKA mobile stats expected raw state [6+2+9]=17 dims, "
+                f"got shape {st.shape}."
+            )
+        canonical = np.zeros(st.shape[:-1] + (sum(schema.state_dims),), dtype=np.float32)
+        canonical[:, :6] = st[:, :6]
+        canonical[:, 7] = st[:, 7]
+        canonical[:, 8:10] = st[:, 8 + 3:8 + 5]
+        out.append(canonical)
+    return out
+
+
+def _canonicalize_jaka_mobile_actions(acts_ep, schema):
+    """Mirror JakaMobileStateActionTransformFn for statistics."""
+    schema_id = getattr(schema, "schema_id", None)
+    if schema_id not in {"jaka_v21_mobile", "jaka_v21_mobile_action9"}:
+        return acts_ep
+    out = []
+    for act in acts_ep:
+        expected_width = 16 if schema_id == "jaka_v21_mobile" else 9
+        if act.ndim != 2 or act.shape[-1] != expected_width:
+            raise ValueError(f"JAKA mobile stats expected raw action width {expected_width}, got {act.shape}.")
+        canonical = np.zeros(act.shape[:-1] + (sum(schema.action_dims),), dtype=np.float32)
+        canonical[:, :6] = act[:, :6]
+        canonical[:, 7] = act[:, 6]
+        if schema_id == "jaka_v21_mobile":
+            canonical[:, 8:10] = act[:, 7 + 3:7 + 5]
+        else:
+            canonical[:, 8:10] = act[:, 7:9]
+        out.append(canonical)
+    return out
+
+
 def _clear_stats_invalidated(ds_root: Path) -> None:
     """Remove the ``stats_invalidated`` block left by ``cleanup.apply`` after a
     successful stats recompute.
@@ -337,6 +379,8 @@ def main():
     # the same canonical space produced by JakaStateGripperTransformFn.
     states_ep = _canonicalize_jaka_states(states_ep, schema)
     acts_ep = _canonicalize_jaka_actions(acts_ep, schema)
+    states_ep = _canonicalize_jaka_mobile_states(states_ep, schema)
+    acts_ep = _canonicalize_jaka_mobile_actions(acts_ep, schema)
 
     # Readers return RAW source-layout arrays for schemas that declare
     # source_*_keys; the delta_mask is CANONICAL. Canonicalize first so
@@ -402,6 +446,18 @@ def main():
         "action": rs_action_delta.get_statistics(),
         "action_abs": rs_action_abs.get_statistics(),
     }
+    if getattr(schema, "schema_id", None) in {
+        "jaka_v21_mobile", "jaka_v21_mobile_action9",
+    }:
+        base_std = np.asarray(stats["action_abs"].std)[8:10]
+        if base_std.shape != (2,) or not np.all(np.isfinite(base_std)) or np.all(base_std < 1e-8):
+            raise ValueError(
+                "JAKA mobile action labels for agv_linear/agv_angular are "
+                "constant or missing. Refusing to write mobile stats because "
+                "training would teach the base to output a constant command. "
+                "Provide real base command/velocity targets or use the arm-only "
+                "schema."
+            )
     if args.no_quantile:
         print(
             "[stats] WARNING --no-quantile: writing stats WITHOUT q01/q99. "

@@ -10,9 +10,11 @@ from pathlib import Path
 
 from scripts.utils.dataloader import SkipBadSamplesDataset
 from scripts.utils.dataset_helpers import (
+    MotionWeightedDataset,
     TransformedAdapterDataset,
     _check_gripper_semantic_compat,
     _parse_csv_set,
+    build_jaka_motion_indices,
 )
 
 
@@ -370,6 +372,21 @@ def build_dataset(args):
             # external stats compose correctly. No-op for other schemas.
             stats = adapter.patch_stats_for_next_frame_actions(stats, schema)
 
+        if getattr(schema, "schema_id", None) in {
+            "jaka_v21_mobile", "jaka_v21_mobile_action9",
+        }:
+            base_stats = stats.get("action_abs", {})
+            base_std = base_stats.get("std") if isinstance(base_stats, dict) else None
+            if base_std is None or len(base_std) < 10 or all(
+                float(v) < 1e-8 for v in base_std[8:10]
+            ):
+                raise ValueError(
+                    "JAKA mobile training requires non-constant action labels "
+                    "for agv_linear/agv_angular (canonical action dims 8:10). "
+                    "The current dataset appears to contain only zero base "
+                    "velocity; use the arm-only schema or provide real base targets."
+                )
+
         # Also validate chunk_size for adapter-discovered stats (meta/stats.json),
         # not just the external paths above: a mismatched chunk_size silently
         # drives delta-action normalization with the wrong distribution.
@@ -413,6 +430,24 @@ def build_dataset(args):
                 max_attempts=getattr(args, "data_error_skip_max_attempts", 64),
                 log_first=getattr(args, "data_error_log_first", 20),
                 label=repo_id,
+            )
+        if getattr(args, "motion_sampling", False):
+            if getattr(schema, "schema_id", None) != "jaka_v21_arm_only":
+                raise ValueError(
+                    "--motion_sampling currently supports only "
+                    "jaka_v21_arm_only"
+                )
+            motion_indices = build_jaka_motion_indices(
+                adapter,
+                chunk_size=int(args.chunk_size),
+                threshold=float(args.motion_threshold),
+                gripper_threshold=float(args.motion_gripper_threshold),
+            )
+            transformed = MotionWeightedDataset(
+                transformed,
+                motion_indices,
+                dynamic_probability=float(args.motion_probability),
+                seed=int(getattr(args, "seed", 42)),
             )
         datasets.append(transformed)
         all_stats[repo_id] = stats

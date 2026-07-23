@@ -863,6 +863,84 @@ class JakaStateGripperTransformFn(DataTransformFn):
         return replace(self, enabled=enabled)
 
 
+@DataTransformFn.register_subclass("jaka_mobile_state_action")
+@dataclass
+class JakaMobileStateActionTransformFn(DataTransformFn):
+    """Build a 10-D JAKA + AGV contract from raw observation columns.
+
+    The canonical layout is ``[arm8, agv_linear, agv_angular]``. For datasets
+    whose action column is still arm-only (the current v2.1 dataset), the AGV
+    velocity observations are used as explicit mobile action labels. A future
+    dataset may store the two velocity targets in action[..., 7:9].
+    """
+
+    enabled: bool = False
+    joints_key: str = "observation.joints"
+    gripper_key: str = "observation.gripper"
+    agv_key: str = "observation.agv"
+    state_dim: int = 10
+    action_dim: int = 10
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.enabled:
+            return data
+        joints = data[self.joints_key]
+        gripper = data[self.gripper_key]
+        agv = data[self.agv_key]
+        action = data[ACTION]
+        tensors = []
+        for value in (joints, gripper, agv, action):
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value, dtype=torch.float32)
+            tensors.append(value.to(torch.float32))
+        joints, gripper, agv, action = tensors
+        if joints.shape[-1] != 6 or gripper.shape[-1] != 2 or agv.shape[-1] != 9:
+            raise ValueError(
+                "JakaMobileStateActionTransformFn expects joints[...,6], "
+                f"gripper[...,2], agv[...,9], got {tuple(joints.shape)}, "
+                f"{tuple(gripper.shape)}, {tuple(agv.shape)}"
+            )
+        if action.shape[-1] not in (7, 9):
+            raise ValueError(
+                "JakaMobileStateActionTransformFn expects raw action[...,7] "
+                f"or action[...,9], got {tuple(action.shape)}"
+            )
+        arm_state = torch.cat(
+            [joints, torch.zeros_like(joints[..., :1]), gripper[..., 1:2]], dim=-1
+        )
+        base_state = agv[..., 3:5]
+        data[OBS_STATE] = torch.cat([arm_state, base_state], dim=-1)
+        if action.shape[-1] == 9:
+            base_action = action[..., 7:9]
+        else:
+            # Explicit fallback for the current dataset format. This is a
+            # measured-velocity target, not a recovered hidden command.
+            base_action = agv[..., 3:5]
+        data[ACTION] = torch.cat(
+            [action[..., :6], torch.zeros_like(action[..., :1]),
+             action[..., 6:7], base_action], dim=-1
+        )
+        return data
+
+    def hydrate(self, ctx: "HydrateContext") -> "JakaMobileStateActionTransformFn":
+        return replace(
+            self,
+            enabled=getattr(ctx.schema, "schema_id", None) in {
+                "jaka_v21_mobile", "jaka_v21_mobile_action9",
+            },
+            state_dim=sum(ctx.schema.state_dims)
+            if getattr(ctx.schema, "schema_id", None) in {
+                "jaka_v21_mobile", "jaka_v21_mobile_action9",
+            }
+            else self.state_dim,
+            action_dim=sum(ctx.schema.action_dims)
+            if getattr(ctx.schema, "schema_id", None) in {
+                "jaka_v21_mobile", "jaka_v21_mobile_action9",
+            }
+            else self.action_dim,
+        )
+
+
 @DataTransformFn.register_subclass("pad_state_and_action")
 @dataclass
 class PadStateAndActionTransformFn(DataTransformFn):
