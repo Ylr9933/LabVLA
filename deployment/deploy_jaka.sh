@@ -54,8 +54,12 @@ case "${HOST}" in
         ;;
 esac
 
+# Conda's shell hook may reference PS1 internally. Keep strict mode for the
+# deployment itself, but disable nounset only during hook evaluation.
+set +u
 eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV}"
+set -u
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}"
 export LABVLA_ROOT
 export PYTHONPATH="${LABVLA_ROOT}:${LABVLA_ROOT}/src"
