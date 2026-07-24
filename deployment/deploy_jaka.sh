@@ -17,7 +17,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-31002}"
 DEVICE="${DEVICE:-cuda}"
 CUDA_DEVICE="${CUDA_VISIBLE_DEVICES:-0}"
-CONDA_ENV="${CONDA_ENV:-labvla}"
+CONDA_ENV="${CONDA_ENV:-/data/rbc/miniconda3/envs/labvla}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 OUTPUT_CHUNK_SIZE="${OUTPUT_CHUNK_SIZE:-}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
@@ -63,6 +63,9 @@ set -u
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}"
 export LABVLA_ROOT
 export PYTHONPATH="${LABVLA_ROOT}:${LABVLA_ROOT}/src"
+
+echo "[INFO] Python: $(command -v python)"
+python -c 'import numpy, torch; print("[INFO] NumPy:", numpy.__version__); print("[INFO] PyTorch:", torch.__version__)'
 
 cmd=(
     python "${DEPLOY_DIR}/${SERVE_ENTRYPOINT}"
