@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 
 import torch
 
@@ -9,8 +10,6 @@ _LIBC_HANDLE = None
 
 
 _GRIPPER_SEM_NONE_WARNED: set = set()
-
-
 def _try_malloc_trim() -> bool:
     """Best-effort glibc malloc_trim(0) to return free heap pages to the OS."""
 

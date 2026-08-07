@@ -10,11 +10,9 @@ from pathlib import Path
 
 from scripts.utils.dataloader import SkipBadSamplesDataset
 from scripts.utils.dataset_helpers import (
-    MotionWeightedDataset,
     TransformedAdapterDataset,
     _check_gripper_semantic_compat,
     _parse_csv_set,
-    build_jaka_motion_indices,
 )
 
 
@@ -430,24 +428,6 @@ def build_dataset(args):
                 max_attempts=getattr(args, "data_error_skip_max_attempts", 64),
                 log_first=getattr(args, "data_error_log_first", 20),
                 label=repo_id,
-            )
-        if getattr(args, "motion_sampling", False):
-            if getattr(schema, "schema_id", None) != "jaka_v21_arm_only":
-                raise ValueError(
-                    "--motion_sampling currently supports only "
-                    "jaka_v21_arm_only"
-                )
-            motion_indices = build_jaka_motion_indices(
-                adapter,
-                chunk_size=int(args.chunk_size),
-                threshold=float(args.motion_threshold),
-                gripper_threshold=float(args.motion_gripper_threshold),
-            )
-            transformed = MotionWeightedDataset(
-                transformed,
-                motion_indices,
-                dynamic_probability=float(args.motion_probability),
-                seed=int(getattr(args, "seed", 42)),
             )
         datasets.append(transformed)
         all_stats[repo_id] = stats

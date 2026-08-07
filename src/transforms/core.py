@@ -908,7 +908,15 @@ class JakaMobileStateActionTransformFn(DataTransformFn):
         arm_state = torch.cat(
             [joints, torch.zeros_like(joints[..., :1]), gripper[..., 1:2]], dim=-1
         )
-        base_state = agv[..., 3:5]
+        # ``observation.agv`` is also a declared action source, so the v2.1
+        # adapter may load it as the full action horizon while joints/gripper
+        # remain current-frame state tensors.  State must use the first AGV
+        # sample; action keeps the complete horizon below.
+        if agv.ndim == joints.ndim + 1:
+            agv_state = agv[0]
+        else:
+            agv_state = agv
+        base_state = agv_state[..., 3:5]
         data[OBS_STATE] = torch.cat([arm_state, base_state], dim=-1)
         if action.shape[-1] == 9:
             base_action = action[..., 7:9]

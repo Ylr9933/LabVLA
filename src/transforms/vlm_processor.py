@@ -14,6 +14,10 @@ from src.utils.constants import (
 from src.transforms.core import DataTransformFn, DataDict
 
 
+class InvalidVisualSampleError(RuntimeError):
+    """Retryable sample error for a frame with no readable camera view."""
+
+
 @DataTransformFn.register_subclass("labvla_processor")
 @dataclass
 class Qwen3_VLProcessorTransformFn(DataTransformFn):
@@ -98,7 +102,7 @@ class Qwen3_VLProcessorTransformFn(DataTransformFn):
             # vision attention zeroed, which would silently train on a vision-less
             # sample. SkipBadSamplesDataset (the default wrapper) skips it;
             # without that wrapper the error surfaces the data problem at source.
-            raise ValueError(
+            raise InvalidVisualSampleError(
                 "[Qwen3_VLProcessorTransformFn] all schema-mapped cameras are "
                 f"invalid for this sample (checked {NUM_IMAGE_SLOTS} image "
                 "slots; none had a True *_mask). This sample carries no visual "
