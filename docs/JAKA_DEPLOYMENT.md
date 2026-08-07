@@ -113,6 +113,21 @@ CUDA_VISIBLE_DEVICES=0 \
 bash deployment/deploy_jaka.sh
 ```
 
+```bash
+cd /data1/xuezirui/dev/LabVLA_JAKA
+
+PRETRAINED_PATH=/data2/xuezirui/outputs/labvla_finetune_jaka_mobile_20260806_100801/checkpoint-25000 \
+CUDA_VISIBLE_DEVICES=5 \
+bash /data1/xuezirui/dev/LabVLA_JAKA/deployment/deploy_jaka_mobile.sh
+
+```
+
+cd /data1/xuezirui/dev/LabVLA_JAKA
+conda activate /data/rbc/miniconda3/envs/labvla
+PRETRAINED_PATH=/data2/xuezirui/outputs/labvla_finetune_jaka_20260801_093950/checkpoint-30000 \
+CUDA_VISIBLE_DEVICES=5 \
+bash deployment/deploy_jaka.sh
+
 使用其他端口：
 
 ```bash

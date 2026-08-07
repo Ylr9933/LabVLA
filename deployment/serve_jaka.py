@@ -17,6 +17,9 @@ from pathlib import Path
 
 EXPECTED_SCHEMA_ID = "jaka_v21_arm_only"
 EXPECTED_DIM = 8
+EXPECTED_CAMERA_SLOTS = {
+    f"observation.images.image{i}" for i in range(3)
+}
 
 
 def _checkpoint_schema(checkpoint: Path) -> dict:
@@ -61,9 +64,24 @@ def validate_jaka_checkpoint(checkpoint: Path) -> None:
             f"[JAKA] expected gripper_action_dims=[7], "
             f"got {schema['gripper_action_dims']!r}"
         )
+    image_mapping = schema.get("image_mapping")
+    if not isinstance(image_mapping, dict):
+        raise SystemExit("[JAKA] schema is missing required 3-camera image_mapping")
+    camera_slots = set(str(value) for value in image_mapping.values())
+    if not 1 <= len(image_mapping) <= 3 or not camera_slots.issubset(EXPECTED_CAMERA_SLOTS):
+        raise SystemExit(
+            "[JAKA] expected one to three camera slots from "
+            "observation.images.image0/image1/image2, got "
+            f"{image_mapping!r}"
+        )
+    expected_slots = {f"observation.images.image{i}" for i in range(len(image_mapping))}
+    if camera_slots != expected_slots:
+        raise SystemExit(
+            f"[JAKA] camera slots must be contiguous from image0, got {image_mapping!r}"
+        )
     print(
         "[JAKA] checkpoint contract validated: "
-        f"schema_id={schema_id}, state_dim=8, action_dim=8"
+        f"schema_id={schema_id}, state_dim=8, action_dim=8, cameras={len(image_mapping)}"
     )
 
 

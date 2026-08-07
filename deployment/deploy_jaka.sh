@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Deploy the JAKA 8-D LabVLA policy through the LabVLA-compatible WebSocket API.
+# Deploy the JAKA 8-D, three-camera LabVLA policy through the
+# LabVLA-compatible WebSocket API. serve_jaka.py validates image0/image1/image2
+# in the checkpoint and serve_labvla.py accepts camera_1_rgb/camera_2_rgb/
+# camera_3_rgb on the wire.
 
 set -euo pipefail
 
@@ -13,7 +16,15 @@ if [ -z "${PRETRAINED_PATH}" ]; then
 fi
 
 VLM_PATH="${VLM_PATH:-/data/rbc/VLM/Qwen3-VL-4B-Instruct}"
-HOST="${HOST:-127.0.0.1}"
+# Conda activation may overwrite HOST with its compiler target. Preserve the
+# requested listener address before activating the deployment environment.
+LISTEN_HOST="${HOST:-127.0.0.1}"
+case "${LISTEN_HOST}" in
+    *-conda_*|*-conda_cos*)
+        echo "[WARN] ignoring compiler target in HOST=${LISTEN_HOST}; using 127.0.0.1" >&2
+        LISTEN_HOST="127.0.0.1"
+        ;;
+esac
 PORT="${PORT:-31002}"
 DEVICE="${DEVICE:-cuda}"
 CUDA_DEVICE="${CUDA_VISIBLE_DEVICES:-0}"
@@ -24,7 +35,7 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 MAX_WORKERS="${MAX_WORKERS:-4}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-}"
 MAX_MESSAGE_SIZE="${MAX_MESSAGE_SIZE:-16777216}"
-AUTH_TOKEN="${LABVLA_WS_AUTH_TOKEN:-${AUTH_TOKEN:-}}"
+AUTH_TOKEN="${LABVLA_WS_AUTH_TOKEN:-${AUTH_TOKEN:-labvla_test_2026}}"
 DEFAULT_PROMPT="${DEFAULT_PROMPT:-}"
 NORM_STATS_PATH="${NORM_STATS_PATH:-}"
 TRAINING_REPO_ID="${TRAINING_REPO_ID:-}"
@@ -44,11 +55,11 @@ if [ ! -d "${VLM_PATH}" ] && [ ! -f "${MODEL_ROOT}/vlm_config.json" ]; then
     exit 1
 fi
 
-case "${HOST}" in
+case "${LISTEN_HOST}" in
     127.0.0.1|localhost|::1) ;;
     *)
         if [ -z "${AUTH_TOKEN}" ]; then
-            echo "[ERROR] HOST=${HOST} requires LABVLA_WS_AUTH_TOKEN/AUTH_TOKEN." >&2
+            echo "[ERROR] HOST=${LISTEN_HOST} requires LABVLA_WS_AUTH_TOKEN/AUTH_TOKEN." >&2
             exit 2
         fi
         ;;
@@ -71,7 +82,7 @@ cmd=(
     python "${DEPLOY_DIR}/${SERVE_ENTRYPOINT}"
     --pretrained_path "${PRETRAINED_PATH}"
     --vlm_path "${VLM_PATH}"
-    --host "${HOST}"
+    --host "${LISTEN_HOST}"
     --port "${PORT}"
     --device "${DEVICE}"
     --chunk_size "${CHUNK_SIZE}"
@@ -87,5 +98,5 @@ cmd=(
 [ -n "${NORM_STATS_PATH}" ] && cmd+=(--norm_stats_path "${NORM_STATS_PATH}")
 [ -n "${TRAINING_REPO_ID}" ] && cmd+=(--repo_id "${TRAINING_REPO_ID}")
 
-echo "[INFO] JAKA deployment: ${HOST}:${PORT}, GPU=${CUDA_DEVICE}"
+echo "[INFO] JAKA deployment: ${LISTEN_HOST}:${PORT}, GPU=${CUDA_DEVICE}"
 exec "${cmd[@]}"
