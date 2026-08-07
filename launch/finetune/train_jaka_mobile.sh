@@ -5,8 +5,9 @@ ProjRoot="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # -- Paths --
 VlmPretrainedPath="/data/rbc/VLM/Qwen3-VL-4B-Instruct"
-DataRoot="/data1/xuezirui/data_all/lerobot_v2_data_10"
-OutputDir="${ProjRoot}/outputs"
+CameraCount="${JAKA_CAMERA_COUNT:-2}"
+JakaDataPath="${JAKA_DATA_ROOT:-/data1/xuezirui/data_two_camera/jaka_mobile_rgb2_lerobot_10hz}"
+OutputDir="/data2/xuezirui/outputs"
 DeepspeedConfig="${ProjRoot}/configs/deepspeed_zero2.json"
 FastTokenizerPath="/path/to/fast"
 
@@ -17,9 +18,20 @@ if [ -z "${PretrainedCkpt}" ]; then
 fi
 
 # -- Data --
-RepoIds="jaka_v21_data_1"
-DatasetSchema="${ProjRoot}/schemas/jaka_v21_mobile.py:SCHEMA"
-ExternalStatsPath="${DataRoot}/meta/stats_labvla_jaka_mobile_10d.json"
+if [ -f "${JakaDataPath}/meta/info.json" ]; then
+    DataRoot="$(dirname "${JakaDataPath}")"
+    RepoIds="$(basename "${JakaDataPath}")"
+else
+    DataRoot="${JakaDataPath}"
+    RepoIds="${JAKA_DATASET_NAME:-jaka_mobile_rgb${CameraCount}_lerobot_10hz}"
+fi
+case "${CameraCount}" in
+    1) DatasetSchema="${ProjRoot}/schemas/jaka_v21_mobile.py:SCHEMA_RGB1" ;;
+    2) DatasetSchema="${ProjRoot}/schemas/jaka_v21_mobile.py:SCHEMA_RGB2" ;;
+    3) DatasetSchema="${ProjRoot}/schemas/jaka_v21_mobile.py:SCHEMA_RGB3" ;;
+    *) echo "[ERROR] JAKA_CAMERA_COUNT must be 1, 2, or 3 (got ${CameraCount})" >&2; exit 1 ;;
+esac
+ExternalStatsPath="${DataRoot}/${RepoIds}/meta/stats_labvla_jaka_mobile_10d.json"
 if [ ! -f "${ExternalStatsPath}" ]; then
     echo "[ERROR] Mobile stats not found: ${ExternalStatsPath}" >&2
     echo "        Generate it only after providing non-constant base action labels." >&2
@@ -45,8 +57,8 @@ ImageWidth=224
 BatchSize=48
 GradientAccumulationSteps=1
 NumWorkers=8
-TotalSteps=80000
-SaveFreq=10000
+TotalSteps=30000
+SaveFreq=5000
 LogFreq=50
 Seed=42
 
@@ -60,6 +72,7 @@ DecaySteps="${TotalSteps}"
 DecayLr="2.5e-6"
 
 FreezeVisionEncoder=true
+TrainExpertOnly=false
 GradientCheckpointing=true
 GcVisualEncoder=true
 GcLanguageModel=false
@@ -89,7 +102,7 @@ JobName="labvla_finetune_jaka_mobile_$(date +%Y%m%d_%H%M%S)"
 # -- Environment --
 export PYTHONPATH="src:."
 export PYTHONDONTWRITEBYTECODE=1
-export CUDA_VISIBLE_DEVICES="4,5,6,7"
+export CUDA_VISIBLE_DEVICES="0,1,2,3"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
@@ -137,6 +150,7 @@ exec accelerate launch \
     --decay_steps "${DecaySteps}" \
     --decay_lr "${DecayLr}" \
     --freeze_vision_encoder "${FreezeVisionEncoder}" \
+    --train_expert_only "${TrainExpertOnly}" \
     --gradient_checkpointing "${GradientCheckpointing}" \
     --gc_visual_encoder "${GcVisualEncoder}" \
     --gc_language_model "${GcLanguageModel}" \

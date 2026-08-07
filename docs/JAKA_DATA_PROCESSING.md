@@ -1,213 +1,330 @@
-# JAKA 数据链路与训练说明
+# JAKA 数据处理流程
 
-本文档定义当前项目对 JAKA 数据的训练契约，说明原始字段如何变成模型输入、
-统计量如何生成和使用，以及启动训练前必须检查的条件。
+本文档是当前 JAKA 数据从 raw episode 到 LabVLA LeRobot v2.1 数据集的唯一流程说明。
+目前只维护两种 robot 模式和三种相机数量：
 
-当前实现对应的是 **JAKA 机械臂 8 维训练**。底盘数据虽然记录在原始数据中，
-但尚未作为 policy 的 action 目标接入训练。
+```text
+非 mobile：JAKA 机械臂，8 维 canonical state/action
+mobile：    JAKA 机械臂 + AGV 底盘，10 维 canonical state/action
+相机：      1 路、2 路或 3 路，按 image0..imageN 连续编号
+```
 
-## 1. 训练入口
+转换器位于：
 
-训练脚本：
+```text
+data_process/convert_jaka_rgb3_to_lerobot.py
+```
+
+通用统计入口仍然是：
+
+```text
+python -m data_process stats
+```
+
+## 1. Raw 数据要求
+
+转换器要求 raw root 下存在：
+
+```text
+<raw-root>/episodes/episode_000000/
+    video.mp4
+    video_side.mp4
+    video_wrist.mp4
+    frames.csv
+    frames_side.csv
+    frames_wrist.csv
+    states.csv
+    actions.csv
+    manifest.json
+```
+
+例如带底盘数据的 raw root：
+
+```text
+/data1/xuezirui/move_data/raw_datasets/jaka_raw
+```
+
+转换器以 `--cameras` 的第一路相机时间戳建立输出时间轴，其余选中相机使用最近时间戳帧；state
+在选定时间戳线性插值。只保留选中相机和 state 时间范围的公共区间，避免用边界
+样本制造错误同步。
+
+`actions.csv` 不参与当前转换。机械臂 action 使用下一个采样 state；mobile
+底盘 action 使用 `states.csv` 中的实测速度：
+
+```text
+observation.agv[3] = agv_linear_m_s
+observation.agv[4] = agv_angular_rad_s
+```
+
+这两个量是 measured velocity，不是控制器 command。它们作为速度目标训练，部署
+时模型也输出线速度和角速度。
+
+## 2. 转换器用法
+
+进入仓库并激活训练环境：
+
+```bash
+cd /data1/xuezirui/dev/LabVLA_JAKA
+conda activate /data/rbc/miniconda3/envs/labvla
+```
+
+### 2.1 非 mobile
+
+不加 `--mobile`，生成 arm-only 8 维数据：
+
+```bash
+python -m data_process.convert_jaka_rgb3_to_lerobot \
+    --raw-root /path/to/raw_jaka_rgb3 \
+    --output-parent /path/to/output_parent \
+    --only both \
+    --overwrite
+```
+
+指定相机数量和顺序，例如只用 front + wrist：
+
+```bash
+python -m data_process.convert_jaka_rgb3_to_lerobot \
+    --raw-root /path/to/raw_jaka_rgb3 \
+    --output-parent /path/to/output_parent \
+    --cameras front,wrist \
+    --only both \
+    --overwrite
+```
+
+输出：
+
+```text
+<output-parent>/jaka_rgb2_lerobot_30hz
+<output-parent>/jaka_rgb2_lerobot_10hz
+```
+
+非 mobile 原始字段：
+
+```text
+observation.joints       float32[6]
+observation.gripper      float32[2]
+action                   float32[7]
+image0..imageN            选中的 1/2/3 路视频
+```
+
+训练 schema 按相机数量选择：
+
+```text
+schemas/jaka_v21.py:SCHEMA_RGB1 / SCHEMA_RGB2 / SCHEMA_RGB3
+```
+
+canonical 8 维布局：
+
+```text
+[joint1..joint6, 0, gripper_openness]
+```
+
+### 2.2 Mobile
+
+带底盘数据必须加 `--mobile`：
+
+```bash
+python -m data_process.convert_jaka_rgb3_to_lerobot \
+    --raw-root /data1/xuezirui/move_data/raw_datasets/jaka_raw \
+    --output-parent /data1/xuezirui/move_data \
+    --cameras front,side,wrist \
+    --mobile \
+    --only both \
+    --overwrite
+```
+
+输出：
+
+```text
+/data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_30hz
+/data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz
+```
+
+例如 mobile 两路相机：
+
+```bash
+python -m data_process.convert_jaka_rgb3_to_lerobot \
+    --raw-root /data1/xuezirui/move_data/raw_datasets/jaka_raw \
+    --output-parent /data1/xuezirui/move_data \
+    --cameras front,side \
+    --mobile --only both --overwrite
+```
+
+输出目录会自动使用 `jaka_mobile_rgb2_lerobot_*` 前缀。`--cameras` 可选：
+
+```text
+front
+front,side
+front,side,wrist
+```
+
+第一路相机是主时间轴；所有选中相机必须在每个 episode 中同时存在。
+
+mobile 原始字段：
+
+```text
+observation.joints       float32[6]
+observation.gripper      float32[2]
+observation.agv          float32[9]
+action                   float32[7]
+image0..imageN            选中的 1/2/3 路视频
+```
+
+mobile schema 按相机数量选择：
+
+```text
+schemas/jaka_v21_mobile.py:SCHEMA_RGB1 / SCHEMA_RGB2 / SCHEMA_RGB3
+```
+
+canonical 10 维布局：
+
+```text
+[joint1..joint6, 0, gripper_openness,
+ agv_linear_m_s, agv_angular_rad_s]
+```
+
+前 6 个关节 action 是 delta；保留位、夹爪和底盘速度是 absolute：
+
+```text
+delta_mask = [true, true, true, true, true, true, false, false, false, false]
+```
+
+## 3. 生成训练 stats
+
+转换器会写基础 `meta/stats.json` 和一个初始 sidecar。正式训练前，统一使用
+`data_process stats` 重新生成与训练代码完全一致的 canonical stats。
+
+### 3.1 非 mobile 8 维 stats
+
+```bash
+python -m data_process stats \
+    --dataset /path/to/output_parent/jaka_rgb3_lerobot_10hz \
+    --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21.py:SCHEMA_RGB3 \
+    --chunk_size 50 \
+    --out /path/to/output_parent/jaka_rgb3_lerobot_10hz/meta/stats_labvla_jaka_8d.json
+```
+
+训练入口：
 
 ```text
 launch/finetune/train_jaka.sh
 ```
 
-当前默认配置：
-
-```text
-LabVLA checkpoint: /data1/xuezirui/LabVLA-5B-Base
-Qwen processor:   /data/rbc/VLM/Qwen3-VL-4B-Instruct
-dataset root:     /data1/xuezirui/data_all/lerobot_v2_data_10
-stats file:       /data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
-chunk size:       50
-action mode:      delta
-```
-
-启动命令：
+### 3.2 Mobile 10 维 stats
 
 ```bash
-cd /data1/xuezirui/dev/LabVLA_JAKA
-conda activate /data/rbc/miniconda3/envs/labvla
+python -m data_process stats \
+    --dataset /data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz \
+    --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21_mobile.py:SCHEMA \
+    --chunk_size 50 \
+    --out /data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz/meta/stats_labvla_jaka_mobile_10d.json
+```
+
+stats 文件必须包含：
+
+```text
+observation.state   10 维
+action              10 维 delta-action
+action_abs          10 维 absolute-action
+_chunk_size         50
+q01/q99             必须存在
+```
+
+mobile stats 计算会检查底盘两维不是常数；如果 `agv_linear_m_s` 或
+`agv_angular_rad_s` 没有有效变化，命令会拒绝写出 stats。
+
+`SCHEMA` 与各个 `SCHEMA_RGBN` 在 stats 计算上的 state/action 语义相同。stats
+阶段不读取图像，因此使用 `SCHEMA` 不会丢失相机；训练阶段按相机数量使用对应
+的 `SCHEMA_RGB1/2/3`。
+
+不要使用 `--no-quantile`，默认训练和部署需要 q01/q99。
+
+## 4. 训练入口
+
+非 mobile：
+
+```bash
 bash launch/finetune/train_jaka.sh
 ```
 
-训练时直接读取原始 parquet 和视频。字段映射在内存中完成，不会创建新的
-parquet 数据集，也不会修改原始数据。
-
-## 2. 原始数据契约
-
-`meta/info.json` 中当前相关字段如下：
-
-```text
-observation.joints       [6]
-observation.gripper      [2]
-observation.agv          [9]
-observation.images.front  video
-action                   [7]
-```
-
-夹爪字段的定义是：
-
-```text
-observation.gripper = [gripper_position, gripper_openness]
-action              = [joint_1, ..., joint_6, gripper_openness]
-```
-
-原始 `observation.state` 的 13 维复合向量不直接作为模型 state。训练使用
-`observation.joints` 和 `observation.gripper` 显式构造 canonical state。
-
-## 3. Canonical 8 维布局
-
-`schemas/jaka_v21.py:SCHEMA` 定义当前 schema，
-`JakaStateGripperTransformFn` 执行映射：
-
-```text
-state  = [observation.joints[0:6], 0, observation.gripper[1]]
-action = [action[0:6],              0, action[6]]
-```
-
-因此每个向量的含义为：
-
-| 索引 | 含义 | 处理 |
-|---|---|---|
-| 0-5 | JAKA 六个关节 | 参与 delta 和归一化 |
-| 6 | 保留的第七个 arm slot | 固定为 0，不参与 delta，归一化后仍为 0 |
-| 7 | 夹爪 openness | absolute，使用 q01/q99 归一化 |
-
-当前 schema 的 delta mask 为：
-
-```text
-[true, true, true, true, true, true, false, false]
-```
-
-这意味着前 6 个动作维度使用“动作减当前 state”的 delta，保留位和夹爪
-保持 absolute。
-
-## 4. 底盘数据的边界
-
-原始数据包含：
-
-```text
-observation.agv = [
-    agv_x, agv_y, agv_theta,
-    agv_linear, agv_angular,
-    agv_power_percent, agv_is_moving,
-    agv_charge_state, agv_estop_state
-]
-```
-
-其中 `agv_linear` 和 `agv_angular` 是底盘运动相关的观测量，但当前正式
-`action` 字段仍然只有 7 维机械臂 action。当前 schema 不会自动把
-`observation.agv` 当作动作，也不会把观测速度直接伪装成控制指令。
-
-因此当前训练结果是机械臂模型，不是机械臂加底盘联合控制模型。要训练联合
-控制，必须先确定底盘 action 的真实语义、时间对齐方式和动作维度，再单独
-定义 mobile schema 与 transform。
-
-## 5. 归一化流程
-
-训练样本按以下顺序处理：
-
-```text
-原始 parquet
-    -> JAKA 字段映射为 8 维 state/action
-    -> action delta 计算
-    -> state/action 归一化
-    -> 拼接字段与 padding 到 32 维
-    -> 输入模型
-```
-
-### 5.1 统计文件
-
-训练脚本通过 `--external_stats_path` 使用：
-
-```text
-/data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
-```
-
-文件包含：
-
-```text
-observation.state  canonical 8 维 state 统计
-action              canonical 8 维 delta-action 统计
-action_abs          canonical 8 维 absolute-action 统计
-_chunk_size         统计时使用的 action chunk 长度
-```
-
-其中 `action` 的前 6 维统计的是 delta 分布，`action_abs` 保留原始绝对动作
-分布。当前 `ActionMode=delta`，所以训练归一化使用 `action`。
-
-### 5.2 归一化公式
-
-机械臂关节默认使用 mean/std：
-
-```text
-x_norm = (x - mean) / (std + 1e-6)
-```
-
-夹爪维度使用 q01/q99 映射到约 `[-1, 1]`：
-
-```text
-x_norm = 2 * (x - q01) / (q99 - q01 + 1e-6) - 1
-```
-
-当前配置下：
-
-```text
-state[0:6]  mean/std
-state[7]    q01/q99
-action[0:6] mean/std
-action[7]   q01/q99
-```
-
-第 6 个保留维度原始值恒为 0，因此不会产生有意义的控制信号。
-
-## 6. 重新生成统计量
-
-统计脚本会遍历原始数据计算统计量，但只写出一个 JSON，不会重写 parquet、
-视频或 `meta/info.json`：
+mobile：
 
 ```bash
-cd /data1/xuezirui/dev/LabVLA_JAKA
-conda activate /data/rbc/miniconda3/envs/labvla
-
-python -m data_process stats \
-    --dataset /data1/xuezirui/data_all/lerobot_v2_data_10 \
-    --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21.py:SCHEMA \
-    --chunk_size 50 \
-    --out /data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
+bash launch/finetune/train_jaka_mobile.sh
 ```
 
-统计脚本中的 JAKA canonicalization 与训练时的
-`JakaStateGripperTransformFn` 对齐，避免统计空间和训练输入空间不一致。
-
-## 7. 训练前检查
-
-当前已验证：
+mobile launcher 默认使用：
 
 ```text
-schema:       jaka_v21_arm_only
-episodes:     21
-frames:       13447
-coverage:     100%
-state dim:    8
-action dim:   8
-chunk size:   50
-stats file:   与重新生成结果 SHA256 完全一致
+数据：/data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz
+schema：schemas/jaka_v21_mobile.py:SCHEMA_RGB3
+stats：meta/stats_labvla_jaka_mobile_10d.json
+chunk_size：50
 ```
 
-同时已检查以下路径存在：
+也可以直接指定另一个 dataset root：
+
+```bash
+JAKA_DATA_ROOT=/path/to/jaka_mobile_rgb3_lerobot_10hz \
+bash launch/finetune/train_jaka_mobile.sh
+```
+
+如果数据不是 3 路相机，设置相机数量使 launcher 选择对应 schema：
+
+```bash
+JAKA_CAMERA_COUNT=1 JAKA_DATA_ROOT=/path/to/jaka_mobile_rgb1_lerobot_10hz \
+bash launch/finetune/train_jaka_mobile.sh
+```
+
+非 mobile launcher 使用同样的 `JAKA_CAMERA_COUNT` 环境变量。
+
+只训练 action expert：编辑 launcher：
+
+```bash
+TrainExpertOnly=true
+```
+
+联合训练 VLM 和 expert：
+
+```bash
+TrainExpertOnly=false
+```
+
+## 5. 转换后检查
+
+建议至少检查以下内容：
+
+```bash
+python -m data_process preflight \
+    --repos jaka_mobile_rgb3_lerobot_10hz \
+    --data_root /data1/xuezirui/move_data \
+    --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21_mobile.py:SCHEMA_RGB3 \
+    --external_stats_map jaka_mobile_rgb3_lerobot_10hz=/data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz/meta/stats_labvla_jaka_mobile_10d.json \
+    --chunk_size 50
+```
+
+并确认：
 
 ```text
-/data1/xuezirui/LabVLA-5B-Base
-/data/rbc/VLM/Qwen3-VL-4B-Instruct
-/data1/xuezirui/data_all/lerobot_v2_data_10
-/data1/xuezirui/data_all/lerobot_v2_data_10/meta/stats_labvla_jaka_8d.json
-/data1/xuezirui/dev/LabVLA_JAKA/configs/deepspeed_zero2.json
+meta/info.json                 fps / episode / frame 数正确
+meta/labvla_manifest.json      schema_id=jaka_v21_mobile
+meta/stats_labvla_jaka_mobile_10d.json  state/action=10, chunk=50
+data/chunk-000/*.parquet       observation.agv[9]
+videos/chunk-000/              image0..imageN 选中的视频
 ```
 
-因此，从数据契约、schema、统计量和训练脚本配置看，可以直接开始当前的
-机械臂 8 维训练。实际 GPU 训练尚未在本次检查中启动；启动前仍需确认当前
-shell 使用的是 `labvla` 环境，并确保 PyTorch/CUDA/cuDNN 可正常导入。
+如果重新转换或修改了数据，必须重新生成对应 stats；不要把 8 维 stats 和
+mobile 数据混用，也不要把 mobile 10 维 stats 交给 `train_jaka.sh`。
+
+## 6. 当前保留的工具边界
+
+JAKA 专用 raw RGB3 转换只保留：
+
+```text
+data_process/convert_jaka_rgb3_to_lerobot.py
+data_process/stats/
+```
+
+旧的单相机转换、单 episode 下采样和旧 arm-only split 脚本已移除。通用
+`data_process scan/clean/validate/preflight/stats` 工具仍然保留，供所有
+LeRobot v2.1 数据集使用。

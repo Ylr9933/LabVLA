@@ -28,6 +28,31 @@ The full router entry set (see `cli.py`):
 | `validate` | run dataset-level validators across one or more repos |
 | `preflight` | gate training launch on data-integrity invariants |
 
+## JAKA RGB3
+
+JAKA raw RGB3 conversion is maintained in this package:
+
+```bash
+python -m data_process.convert_jaka_rgb3_to_lerobot \
+    --raw-root /path/to/raw_root \
+    --output-parent /path/to/output_parent \
+    --cameras front,side,wrist \
+    --mobile \
+    --only both \
+    --overwrite
+```
+
+Omit `--mobile` for the arm-only 8-D pipeline. Use `--mobile` for the JAKA + AGV
+10-D pipeline. `--cameras` accepts one, two, or three cameras from
+`front,side,wrist`; the order defines `image0`, `image1`, and `image2`. The
+complete field contract, alignment rules, output layout, stats commands, and
+training launchers are documented in
+[`docs/JAKA_DATA_PROCESSING.md`](../docs/JAKA_DATA_PROCESSING.md).
+
+After conversion, regenerate the launcher-bound stats with
+`python -m data_process stats --chunk_size 50`; do not use arm-only 8-D stats for
+a mobile dataset.
+
 ## Subcommands
 
 ### `scan` — run detectors, produce JSON report

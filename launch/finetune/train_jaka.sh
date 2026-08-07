@@ -5,21 +5,35 @@ ProjRoot="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # -- Paths --
 VlmPretrainedPath="/data/rbc/VLM/Qwen3-VL-4B-Instruct"
-DataRoot="/data1/xuezirui/data_all/lerobot_v2_data_10"
-OutputDir="${ProjRoot}/outputs"
+JakaDataPath="${JAKA_DATA_ROOT:-/data1/xuezirui/data_triple_camera}"
+CameraCount="${JAKA_CAMERA_COUNT:-3}"
+OutputDir="/data2/xuezirui/outputs"
 DeepspeedConfig="${ProjRoot}/configs/deepspeed_zero2.json"
 FastTokenizerPath="/path/to/fast"
 
-PretrainedCkpt="/data1/xuezirui/LabVLA-5B-Base"
+PretrainedCkpt="/data1/xuezirui/LabVLA-5B-Base-ckpt"
 if [ -z "${PretrainedCkpt}" ]; then
     echo "[ERROR] PretrainedCkpt is required. Set it inside the script before running." >&2
     exit 1
 fi
 
 # -- Data --
-RepoIds="jaka_v21_data_1"
-DatasetSchema="${ProjRoot}/schemas/jaka_v21.py:SCHEMA"
-ExternalStatsPath="${DataRoot}/meta/stats_labvla_jaka_8d.json"
+# Accept either the dataset parent directory plus JAKA_DATASET_NAME, or a
+# direct dataset root passed as JAKA_DATA_ROOT.
+if [ -f "${JakaDataPath}/meta/info.json" ]; then
+    DataRoot="$(dirname "${JakaDataPath}")"
+    RepoIds="$(basename "${JakaDataPath}")"
+else
+    DataRoot="${JakaDataPath}"
+    RepoIds="${JAKA_DATASET_NAME:-jaka_rgb${CameraCount}_lerobot_10hz}"
+fi
+case "${CameraCount}" in
+    1) DatasetSchema="${ProjRoot}/schemas/jaka_v21.py:SCHEMA_RGB1" ;;
+    2) DatasetSchema="${ProjRoot}/schemas/jaka_v21.py:SCHEMA_RGB2" ;;
+    3) DatasetSchema="${ProjRoot}/schemas/jaka_v21.py:SCHEMA_RGB3" ;;
+    *) echo "[ERROR] JAKA_CAMERA_COUNT must be 1, 2, or 3 (got ${CameraCount})" >&2; exit 1 ;;
+esac
+ExternalStatsPath="${DataRoot}/${RepoIds}/meta/stats_labvla_jaka_8d.json"
 
 # -- Cluster --
 NumGpus=4
@@ -40,8 +54,8 @@ ImageWidth=224
 BatchSize=48
 GradientAccumulationSteps=1
 NumWorkers=8
-TotalSteps=80000
-SaveFreq=10000
+TotalSteps=30000
+SaveFreq=3000
 LogFreq=50
 Seed=42
 
@@ -55,6 +69,7 @@ DecaySteps="${TotalSteps}"
 DecayLr="2.5e-6"
 
 FreezeVisionEncoder=true
+TrainExpertOnly=false
 GradientCheckpointing=true
 GcVisualEncoder=true
 GcLanguageModel=false
@@ -68,7 +83,6 @@ GripperNormMode="q01_q99"
 SnapGripperToBinary=false
 GripperMaxWidth=0.04
 GripperCanonicalDim=7
-
 if [ "${ActionMode}" != "delta" ]; then
     echo "[ERROR] JAKA finetune requires ActionMode=delta." >&2
     exit 1
@@ -132,6 +146,7 @@ exec accelerate launch \
     --decay_steps "${DecaySteps}" \
     --decay_lr "${DecayLr}" \
     --freeze_vision_encoder "${FreezeVisionEncoder}" \
+    --train_expert_only "${TrainExpertOnly}" \
     --gradient_checkpointing "${GradientCheckpointing}" \
     --gc_visual_encoder "${GcVisualEncoder}" \
     --gc_language_model "${GcLanguageModel}" \
