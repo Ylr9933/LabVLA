@@ -144,9 +144,9 @@ python -m data_process.convert_jaka_rgb3_to_lerobot \
 
 ```bash
 python -m data_process.convert_jaka_rgb3_to_lerobot \
-    --raw-root /data1/xuezirui/move_data/raw_datasets/jaka_raw \
-    --output-parent /data1/xuezirui/move_data \
-    --cameras front,side \
+    --raw-root /data1/xuezirui/jaka_raw_three_camera \
+    --output-parent /data1/xuezirui/data_lab \
+    --cameras front,side,wrist \
     --mobile --only both --overwrite
 ```
 
@@ -214,10 +214,10 @@ launch/finetune/train_jaka.sh
 
 ```bash
 python -m data_process stats \
-    --dataset /data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz \
+    --dataset /data1/xuezirui/data_lab/jaka_mobile_rgb3_lerobot_10hz \
     --schema /data1/xuezirui/dev/LabVLA_JAKA/schemas/jaka_v21_mobile.py:SCHEMA \
     --chunk_size 50 \
-    --out /data1/xuezirui/move_data/jaka_mobile_rgb3_lerobot_10hz/meta/stats_labvla_jaka_mobile_10d.json
+    --out /data1/xuezirui/data_lab/jaka_mobile_rgb3_lerobot_10hz/meta/stats_labvla_jaka_mobile_10d.json
 ```
 
 stats 文件必须包含：

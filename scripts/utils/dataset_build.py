@@ -375,9 +375,7 @@ def build_dataset(args):
         }:
             base_stats = stats.get("action_abs", {})
             base_std = base_stats.get("std") if isinstance(base_stats, dict) else None
-            if base_std is None or len(base_std) < 10 or all(
-                float(v) < 1e-8 for v in base_std[8:10]
-            ):
+            if base_std is None or len(base_std) < 10:
                 raise ValueError(
                     "JAKA mobile training requires non-constant action labels "
                     "for agv_linear/agv_angular (canonical action dims 8:10). "

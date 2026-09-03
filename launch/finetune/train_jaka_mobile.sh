@@ -5,8 +5,8 @@ ProjRoot="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # -- Paths --
 VlmPretrainedPath="/data/rbc/VLM/Qwen3-VL-4B-Instruct"
-CameraCount="${JAKA_CAMERA_COUNT:-2}"
-JakaDataPath="${JAKA_DATA_ROOT:-/data1/xuezirui/data_two_camera/jaka_mobile_rgb2_lerobot_10hz}"
+CameraCount="${JAKA_CAMERA_COUNT:-3}"
+JakaDataPath="${JAKA_DATA_ROOT:-/data1/xuezirui/data_lab/jaka_mobile_rgb3_lerobot_10hz}"
 OutputDir="/data2/xuezirui/outputs"
 DeepspeedConfig="${ProjRoot}/configs/deepspeed_zero2.json"
 FastTokenizerPath="/path/to/fast"
@@ -57,8 +57,8 @@ ImageWidth=224
 BatchSize=48
 GradientAccumulationSteps=1
 NumWorkers=8
-TotalSteps=30000
-SaveFreq=5000
+TotalSteps=80000
+SaveFreq=10000
 LogFreq=50
 Seed=42
 
@@ -72,7 +72,7 @@ DecaySteps="${TotalSteps}"
 DecayLr="2.5e-6"
 
 FreezeVisionEncoder=true
-TrainExpertOnly=false
+TrainExpertOnly=true
 GradientCheckpointing=true
 GcVisualEncoder=true
 GcLanguageModel=false

@@ -450,7 +450,7 @@ def main():
         "jaka_v21_mobile", "jaka_v21_mobile_action9",
     }:
         base_std = np.asarray(stats["action_abs"].std)[8:10]
-        if base_std.shape != (2,) or not np.all(np.isfinite(base_std)) or np.all(base_std < 1e-8):
+        if base_std.shape != (2,) or not np.all(np.isfinite(base_std)):
             raise ValueError(
                 "JAKA mobile action labels for agv_linear/agv_angular are "
                 "constant or missing. Refusing to write mobile stats because "

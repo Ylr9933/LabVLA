@@ -116,8 +116,8 @@ bash deployment/deploy_jaka.sh
 ```bash
 cd /data1/xuezirui/dev/LabVLA_JAKA
 
-PRETRAINED_PATH=/data2/xuezirui/outputs/labvla_finetune_jaka_mobile_20260806_100801/checkpoint-25000 \
-CUDA_VISIBLE_DEVICES=5 \
+PRETRAINED_PATH=/data2/xuezirui/outputs/labvla_finetune_jaka_mobile_20260828_113930/checkpoint-70000 \
+CUDA_VISIBLE_DEVICES=0 \
 bash /data1/xuezirui/dev/LabVLA_JAKA/deployment/deploy_jaka_mobile.sh
 
 ```
